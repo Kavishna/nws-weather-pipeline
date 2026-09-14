@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Any local service account key / credentials file - never commit these
+*firebase-key*.json
+*serviceAccount*.json
+*service-account*.json
+*credentials*.json
+
+# Local test artifacts from earlier runs
+_pipeline_out_*.png
+_tmp_*.png
+_discord_out_*.png
+*.db
+
+.DS_Store

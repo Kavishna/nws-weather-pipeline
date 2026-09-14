@@ -1,0 +1,39 @@
+name: NWS Alert Pipeline
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # every 5 minutes - GitHub Actions' fastest allowed interval (2 min isn't possible here)
+  workflow_dispatch: {}      # lets you trigger a run manually from the Actions tab, for testing
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Caches the Chromium binary across runs so most runs skip the ~300MB
+      # download - each run is otherwise a brand-new VM with nothing installed.
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Write Firebase service account key
+        run: echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}' > /tmp/firebase-key.json
+
+      - name: Run one pipeline pass
+        env:
+          MAPBOX_ACCESS_TOKEN: ${{ secrets.MAPBOX_ACCESS_TOKEN }}
+          GOOGLE_APPLICATION_CREDENTIALS: /tmp/firebase-key.json
+        run: python run_once.py
