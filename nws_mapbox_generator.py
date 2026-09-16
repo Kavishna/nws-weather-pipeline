@@ -272,23 +272,67 @@ def clean_bullet(bullet: str) -> str:
     return f"{label.strip().title()}: {rest.strip()}"
 
 
-def build_facebook_caption(feature: dict, is_update: bool = False) -> str:
+def build_plain_english_opener(feature: dict, bullets: list) -> str:
     """
-    Builds a ready-to-post Facebook caption from an NWS alert feature:
-    headline + WHAT/WHERE/WHEN/IMPACTS bullets (from `description`) +
-    safety instructions (from `instruction`) + expiry time + source/link.
-    This is deliberately separate from what goes ON the map image itself -
-    the image gets only event/area/time/severity; the long-form detail
-    (description, instruction) belongs in the caption where it's actually
-    readable.
-
-    is_update=True prefixes the caption to make clear this is the SAME
-    warning being re-posted because something about it genuinely changed
-    (extended, expanded, corrected) - not a brand-new alert.
+    A synthesized, human-sounding opening line instead of leading with a
+    raw WHAT/WHERE/WHEN bullet dump - e.g. 'Dangerous rip currents for
+    Coastal Volusia — through early this evening' rather than three
+    separately parsed fragments read as fragments. Falls back to the NWS
+    headline (still human-written, just less tailored) if a usable WHAT
+    bullet isn't found.
     """
     props = feature.get("properties", {})
     event = props.get("event", "Weather Alert")
     area_desc = props.get("areaDesc", "")
+    headline = props.get("headline", "")
+    zone_text = shorten_area_desc(area_desc)
+
+    what_text, when_text = "", ""
+    for b in bullets:
+        lower = b.lower()
+        if lower.startswith("what:"):
+            what_text = b.split(":", 1)[1].strip().rstrip(".")
+        elif lower.startswith("when:"):
+            when_text = b.split(":", 1)[1].strip().rstrip(".")
+
+    if what_text:
+        sentence = f"{what_text} for {zone_text}"
+        if when_text:
+            sentence += f" — {when_text}"
+        return sentence + "."
+    return headline or f"{event} in effect for {zone_text}."
+
+
+def build_hashtags(feature: dict) -> str:
+    """A couple of lightweight hashtags (state + event) for discoverability."""
+    props = feature.get("properties", {})
+    event = props.get("event", "")
+    state = get_alert_state(feature)
+    event_tag = re.sub(r"[^A-Za-z]", "", event)
+    tags = []
+    if state:
+        tags.append(f"#{state}Weather")
+    if event_tag:
+        tags.append(f"#{event_tag}")
+    return " ".join(tags)
+
+
+def build_facebook_caption(feature: dict, is_update: bool = False) -> str:
+    """
+    Builds a ready-to-post caption: icon + event header, a synthesized
+    plain-English opener, the FULL safety instruction (kept intact and
+    prominent - this is the one part of the raw NWS text that should never
+    be trimmed), the WHAT/WHERE/WHEN/IMPACTS bullets (with any "Additional
+    Details" bullet demoted to after the core ones, since it's usually
+    about adjacent areas rather than the alert itself), expiry, source, and
+    a couple of hashtags.
+
+    is_update=True adds a line making clear this is the SAME warning being
+    re-posted because something about it genuinely changed (extended,
+    expanded, corrected) - not a brand-new alert.
+    """
+    props = feature.get("properties", {})
+    event = props.get("event", "Weather Alert")
     expires = props.get("expires", "")
     instruction = props.get("instruction", "")
     sender = props.get("senderName", "")
@@ -296,22 +340,39 @@ def build_facebook_caption(feature: dict, is_update: bool = False) -> str:
     description = props.get("description", "")
 
     bullets = [clean_bullet(b) for b in parse_description_bullets(description)]
-    bullets_text = "\n".join(f"• {b}" for b in bullets)
+    main_bullets = [b for b in bullets if not b.lower().startswith("additional details")]
+    extra_bullets = [b for b in bullets if b.lower().startswith("additional details")]
+
+    opener = build_plain_english_opener(feature, bullets)
     expires_str = format_alert_time_local(expires, get_alert_state(feature)) if expires else ""
     instruction_clean = " ".join(instruction.split()) if instruction else ""
+    icon = get_event_icon(event)
 
-    header = f"🔄 UPDATE: {event.upper()} — {area_desc}" if is_update else f"⚠️ {event.upper()} — {area_desc}"
-    lines = [header, ""]
+    header = f"🔄 UPDATE: {icon} {event.upper()}" if is_update else f"{icon} {event.upper()}"
+    lines = [header, "", opener, ""]
+
     if is_update:
         lines += ["This warning has been updated (extended, expanded, or corrected).", ""]
-    if bullets_text:
-        lines += [bullets_text, ""]
+
     if instruction_clean:
         lines += [f"🛟 {instruction_clean}", ""]
+
+    if main_bullets:
+        lines += [f"• {b}" for b in main_bullets]
+        lines.append("")
+
+    if extra_bullets:
+        lines += [f"• {b}" for b in extra_bullets]
+        lines.append("")
+
     if expires_str:
         lines.append(f"⏰ In effect until {expires_str}.")
     if sender:
         lines.append(f"Source: {sender}" + (f" | {web}" if web else ""))
+
+    hashtags = build_hashtags(feature)
+    if hashtags:
+        lines += ["", hashtags]
 
     return "\n".join(lines)
 
@@ -528,7 +589,7 @@ def generate_mapbox_nws_image(
     feature: dict,
     token: str,
     output_filename: str = "nws_fb_alert.png",
-    map_style: str = "dark-v11",       # Mapbox style
+    map_style: str = "streets-v12",    # Mapbox style
     preset_ratio: str = "portrait",    # 'portrait', 'square', 'landscape'
     padding: int = 140,                # Padding around polygon frame
     label_scale: float = 1.8,          # <--- INCREASES TEXT SIZE! (1.5 to 2.0 works best)
@@ -618,6 +679,62 @@ def shorten_area_desc(area_desc: str, max_parts: int = 2) -> str:
     return f"{shown} & {remaining} more"
 
 
+# Emoji icon per event category - a quick visual cue readable in the half-
+# second before someone reads the actual headline text. Matched the same
+# way as NWS_COLOR_PALETTE: longest/most-specific keyword wins.
+EVENT_ICONS = {
+    "Tornado": "🌪️", "Hurricane": "🌀", "Tropical Storm": "🌀", "Typhoon": "🌀",
+    "Thunderstorm": "⛈️", "Flood": "🌊", "Rip Current": "🌊", "Beach Hazard": "🌊",
+    "Surf": "🌊", "Tsunami": "🌊", "Fire": "🔥", "Winter": "❄️", "Snow": "❄️",
+    "Blizzard": "❄️", "Ice": "🧊", "Freeze": "🥶", "Frost": "🥶", "Heat": "🌡️",
+    "Wind": "💨", "Fog": "🌫️", "Dust": "🌪️", "Smoke": "🌫️",
+}
+
+
+def get_event_icon(event_name: str) -> str:
+    """Longest-keyword-match icon lookup, same pattern as get_nws_colors."""
+    event_lower = event_name.lower()
+    matches = [k for k in EVENT_ICONS if k.lower() in event_lower]
+    if matches:
+        return EVENT_ICONS[max(matches, key=len)]
+    return "⚠️"
+
+
+def get_action_phrase(severity: str, urgency: str) -> str:
+    """
+    Plain-language stand-in for raw NWS severity/urgency jargon. 'MODERATE'
+    or 'EXPECTED' don't tell a non-meteorologist what to actually do -
+    these three tiers map roughly to how urgently a reader should react.
+    """
+    severity = (severity or "").lower()
+    urgency = (urgency or "").lower()
+    if severity in ("extreme", "severe") and urgency in ("immediate", "expected"):
+        return "TAKE ACTION NOW"
+    if severity == "moderate":
+        return "STAY ALERT"
+    return "BE AWARE"
+
+
+def get_nearby_place_name(lon: float, lat: float, token: str) -> str:
+    """
+    Reverse-geocodes a coordinate to the nearest recognizable city/town via
+    Mapbox's Geocoding API - 'Near Daytona Beach' means a lot more to a
+    scrolling reader than the raw NWS zone name 'Coastal Volusia'. Returns
+    "" on any failure so callers can fall back to the zone-based text
+    instead of breaking image generation over a non-critical lookup.
+    """
+    url = f"https://api.mapbox.com/geocoding/v5/mapbox.places/{lon},{lat}.json"
+    try:
+        resp = requests.get(url, params={"types": "place", "access_token": token}, timeout=10)
+        resp.raise_for_status()
+        features = resp.json().get("features", [])
+        if features:
+            return features[0].get("text", "")
+    except requests.RequestException:
+        pass
+    return ""
+
+
 def build_html_template(
     feature: dict,
     map_image_path: str,
@@ -639,13 +756,31 @@ def build_html_template(
     reads clearly as an update rather than a brand-new alert.
     """
     props = feature.get("properties", {})
-    event = props.get("event", "Weather Alert").upper()
-    severity = props.get("severity", "").upper()
+    event_raw = props.get("event", "Weather Alert")
+    event = event_raw.upper()
+    severity = props.get("severity", "")
+    urgency = props.get("urgency", "")
     area_desc = props.get("areaDesc", "")
     expires = props.get("expires", "")
     sender = props.get("senderName", "")
+    geometry = feature.get("geometry")
 
-    area_display = shorten_area_desc(area_desc)
+    icon = get_event_icon(event_raw)
+    action_phrase = get_action_phrase(severity, urgency)
+
+    # "Near <city>" reads far better than a raw NWS zone name to someone
+    # scrolling fast - falls back to the zone text if reverse geocoding
+    # fails or the alert has no inline geometry to take a centroid from.
+    place_name = ""
+    if geometry:
+        try:
+            centroid = shape(geometry).centroid
+            place_name = get_nearby_place_name(centroid.x, centroid.y, MAPBOX_ACCESS_TOKEN)
+        except Exception:
+            place_name = ""
+    zone_text = shorten_area_desc(area_desc)
+    area_display = f"Near {place_name} — {zone_text}" if place_name else zone_text
+
     expires_display = format_alert_time_local(expires, get_alert_state(feature)) if expires else ""
     badge_text_color = contrasting_halo(primary_color)
     map_data_uri = image_to_data_uri(map_image_path)
@@ -653,10 +788,6 @@ def build_html_template(
     expires_html = ""
     if expires_display:
         expires_html = f'<div class="expires-text">⏰ Until {expires_display}</div>'
-
-    severity_html = ""
-    if severity:
-        severity_html = f'<div class="severity-badge">{severity}</div>'
 
     update_html = ""
     if is_update:
@@ -673,6 +804,7 @@ def build_html_template(
         font-family: 'Helvetica Neue', Arial, sans-serif;
         position: relative;
         overflow: hidden;
+        border: 14px solid {primary_color};
     }}
     .map-bg {{
         position: absolute;
@@ -711,10 +843,15 @@ def build_html_template(
     }}
     .event-title {{
         color: #FFFFFF;
-        font-size: 54px;
+        font-size: 50px;
         font-weight: 800;
         line-height: 1.15;
         text-shadow: 0 2px 10px rgba(0,0,0,0.65);
+    }}
+    .event-icon {{
+        font-size: 50px;
+        margin-right: 12px;
+        vertical-align: -6px;
     }}
     .bottom-panel {{
         position: absolute;
@@ -740,20 +877,27 @@ def build_html_template(
         color: rgba(255,255,255,0.75);
         font-size: 18px;
         font-weight: 400;
+        margin-bottom: 6px;
+    }}
+    .details-cue {{
+        color: rgba(255,255,255,0.6);
+        font-size: 16px;
+        font-weight: 400;
     }}
 </style>
 </head>
 <body>
     <img class="map-bg" src="{map_data_uri}" />
     <div class="top-banner">
-        {severity_html}
+        <div class="severity-badge">{action_phrase}</div>
         {update_html}
-        <div class="event-title">{event}</div>
+        <div class="event-title"><span class="event-icon">{icon}</span>{event}</div>
     </div>
     <div class="bottom-panel">
         <div class="area-text">{area_display}</div>
         {expires_html}
         <div class="source-text">Source: {sender}</div>
+        <div class="details-cue">👇 Full details below</div>
     </div>
 </body>
 </html>"""
@@ -791,7 +935,7 @@ def generate_styled_facebook_image(
     feature: dict,
     token: str,
     output_filename: str = "fb_alert_styled.png",
-    map_style: str = "dark-v11",
+    map_style: str = "streets-v12",
     preset_ratio: str = "portrait",
     padding: int = 140,
     is_update: bool = False,
@@ -905,35 +1049,42 @@ def safe_filename(alert_id: str) -> str:
 
 def fetch_alerts_for_states(states: list) -> list:
     """
-    Fetches active alerts for each target state via NWS's dedicated
-    per-area endpoint (GET /alerts/active/area/{state}), and de-duplicates
-    by alert id - an alert spanning a state border shows up once per state
-    it touches, and we only want to FETCH it once. Which destinations it
-    then gets POSTED to is a separate, later step (see get_alert_touched_states
-    + the fan-out in run_alert_pipeline) - fetching once and fanning out
-    afterward avoids fetching the same alert N times over the wire.
+    Fetches ALL currently active NWS alerts in ONE request (instead of one
+    request per state), then filters locally to alerts touching any of
+    `states` (via their UGC zone codes). This is 1 network call regardless
+    of whether you're tracking 10 states or 50 - the per-state version
+    scaled linearly with state count, this doesn't.
+
+    Trade-off worth knowing: the response payload is now the full national
+    feed (bigger single download) rather than 10 small targeted ones, and
+    filtering relies on each alert carrying UGC codes - the vast majority
+    do, but a malformed/edge-case product with empty geocode.UGC would be
+    silently dropped here, whereas NWS's own server-side area filter might
+    have still included it. Rare in practice for VTEC-carrying warnings.
     """
+    url = "https://api.weather.gov/alerts/active"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+        features = resp.json().get("features", [])
+    except requests.RequestException as e:
+        print(f"⚠️ Could not fetch active alerts: {e}")
+        return []
+
+    target_states = set(states)
     seen_ids = set()
     combined = []
 
-    for state in states:
-        url = f"https://api.weather.gov/alerts/active/area/{state}"
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=15)
-            resp.raise_for_status()
-            features = resp.json().get("features", [])
-        except requests.RequestException as e:
-            print(f"⚠️ Could not fetch alerts for {state}: {e}")
+    for f in features:
+        if f.get("properties", {}).get("status") == "Test":
             continue
-
-        for f in features:
-            if f.get("properties", {}).get("status") == "Test":
-                continue
-            alert_id = get_alert_id(f)
-            if not alert_id or alert_id in seen_ids:
-                continue
-            seen_ids.add(alert_id)
-            combined.append(f)
+        if not (get_alert_touched_states(f) & target_states):
+            continue
+        alert_id = get_alert_id(f)
+        if not alert_id or alert_id in seen_ids:
+            continue
+        seen_ids.add(alert_id)
+        combined.append(f)
 
     return combined
 
@@ -1003,6 +1154,36 @@ def bootstrap_destination(db, state: str, platform: str, config: dict) -> None:
     data.setdefault("baseline_seeded", {})[platform] = False
     doc_ref.set(data)
     print(f"➕ Added {platform} destination for {state}.")
+
+
+def update_destination_platform(db, state: str, platform: str, **fields) -> None:
+    """
+    Updates one or more config fields on an EXISTING (state, platform)
+    destination - e.g. swapping a webhook URL, or filling in real Facebook/
+    Instagram/TikTok credentials once they're ready (replacing the empty
+    placeholder values bootstrap_destination created). Unlike
+    bootstrap_destination (which never overwrites), this is specifically
+    for changing values on a platform that's already configured.
+
+    Deliberately does NOT touch baseline_seeded - swapping in a new token
+    for the same account isn't a reason to re-run the backlog-flood
+    baseline seed; that's only for a platform's first-ever check.
+    """
+    dest_ref = db.collection("destinations").document(state)
+    snapshot = dest_ref.get()
+    if not snapshot.exists:
+        raise ValueError(f"No destination doc exists for state '{state}' - run bootstrap_firestore.py first.")
+
+    data = snapshot.to_dict()
+    if platform not in data.get("platforms", {}):
+        raise ValueError(
+            f"State '{state}' has no '{platform}' platform configured yet - "
+            f"use bootstrap_destination() to add it first, not this function."
+        )
+
+    updates = {f"platforms.{platform}.{key}": value for key, value in fields.items()}
+    dest_ref.update(updates)
+    print(f"✅ Updated {state}/{platform}: {list(fields.keys())}")
 
 
 def get_enabled_destinations(db) -> dict:
@@ -1120,17 +1301,40 @@ def post_to_discord(webhook_url: str, image_path: str, caption: str) -> bool:
 
 def post_to_facebook(page_id: str, access_token: str, image_path: str, caption: str) -> bool:
     """
-    Placeholder for Facebook Graph API posting - not implemented yet since
-    no FB pages exist. Facebook's Page photo endpoint DOES accept a direct
-    file upload (unlike Instagram/TikTok below), so this stays closest in
-    shape to post_to_discord once it's built.
-    Real call: POST /{page_id}/photos with the image file + caption as
-    `message`, using a long-lived Page access token.
+    Posts the composited image + caption to a Facebook Page via the Graph
+    API's /{page_id}/photos endpoint. Unlike Instagram/TikTok, this DOES
+    accept a direct file upload - no public image hosting needed, closest
+    in shape to post_to_discord.
+
+    Returns True only on a confirmed success (a post id back from the API);
+    any error response - dead/expired token, revoked permission, rate limit -
+    returns False so the caller leaves it unmarked, to be retried next cycle.
+    A genuinely dead token will keep failing every retry until you notice
+    and refresh it (see update_destination.py) - that's expected, not a bug;
+    there's no way to distinguish "will succeed on retry" from "permanently
+    broken" from the response alone, so both get the same safe treatment.
     """
-    raise NotImplementedError(
-        "Facebook posting not implemented yet - add the Graph API call here once pages exist "
-        "(POST to /{page_id}/photos with the image + caption as `message`, using a Page access token)."
-    )
+    url = f"https://graph.facebook.com/v19.0/{page_id}/photos"
+    try:
+        with open(image_path, "rb") as f:
+            files = {"source": (os.path.basename(image_path), f, "image/png")}
+            data = {"caption": caption, "access_token": access_token}
+            resp = requests.post(url, data=data, files=files, timeout=30)
+    except requests.RequestException as e:
+        print(f"❌ Facebook post failed (network error): {e}")
+        return False
+
+    if resp.status_code != 200:
+        print(f"❌ Facebook post failed ({resp.status_code}): {resp.text}")
+        return False
+
+    result = resp.json()
+    if "id" not in result and "post_id" not in result:
+        print(f"❌ Facebook post response missing post id: {result}")
+        return False
+
+    print(f"✅ Posted to Facebook page {page_id}")
+    return True
 
 
 def post_to_instagram(ig_user_id: str, access_token: str, image_path: str, caption: str) -> bool:
@@ -1199,7 +1403,7 @@ def post_alert_to_platform(alert: dict, state: str, platform: str, config: dict,
             feature=alert,
             token=MAPBOX_ACCESS_TOKEN,
             output_filename=out_path,
-            map_style="dark-v11",
+            map_style="streets-v12",
             preset_ratio="portrait",
             padding=140,
             is_update=is_update,
