@@ -274,33 +274,37 @@ def clean_bullet(bullet: str) -> str:
 
 def build_plain_english_opener(feature: dict, bullets: list) -> str:
     """
-    A synthesized, human-sounding opening line instead of leading with a
-    raw WHAT/WHERE/WHEN bullet dump - e.g. 'Dangerous rip currents for
-    Coastal Volusia — through early this evening' rather than three
-    separately parsed fragments read as fragments. Falls back to the NWS
-    headline (still human-written, just less tailored) if a usable WHAT
-    bullet isn't found.
+    A synthesized, human-sounding opening line: WHAT + WHERE + WHEN folded
+    into one sentence. Uses NWS's own WHERE bullet for location - a
+    genuine human-written description ('Portions of southeast Kansas and
+    central Missouri') - rather than the raw areaDesc county/zone list
+    ('Bourbon, Crawford & 27 more'), which reads terribly once an alert
+    spans more than a couple counties. Falls back to the NWS headline (also
+    human-written, just less tailored) if no usable WHAT bullet exists.
     """
     props = feature.get("properties", {})
     event = props.get("event", "Weather Alert")
     area_desc = props.get("areaDesc", "")
     headline = props.get("headline", "")
-    zone_text = shorten_area_desc(area_desc)
 
-    what_text, when_text = "", ""
+    what_text, where_text, when_text = "", "", ""
     for b in bullets:
         lower = b.lower()
         if lower.startswith("what:"):
             what_text = b.split(":", 1)[1].strip().rstrip(".")
+        elif lower.startswith("where:"):
+            where_text = b.split(":", 1)[1].strip().rstrip(".")
         elif lower.startswith("when:"):
             when_text = b.split(":", 1)[1].strip().rstrip(".")
 
+    location = where_text or shorten_area_desc(area_desc)
+
     if what_text:
-        sentence = f"{what_text} for {zone_text}"
+        sentence = f"{what_text} for {location}"
         if when_text:
             sentence += f" — {when_text}"
         return sentence + "."
-    return headline or f"{event} in effect for {zone_text}."
+    return headline or f"{event} in effect for {location}."
 
 
 def build_hashtags(feature: dict) -> str:
@@ -320,12 +324,19 @@ def build_hashtags(feature: dict) -> str:
 def build_facebook_caption(feature: dict, is_update: bool = False) -> str:
     """
     Builds a ready-to-post caption: icon + event header, a synthesized
-    plain-English opener, the FULL safety instruction (kept intact and
-    prominent - this is the one part of the raw NWS text that should never
-    be trimmed), the WHAT/WHERE/WHEN/IMPACTS bullets (with any "Additional
-    Details" bullet demoted to after the core ones, since it's usually
-    about adjacent areas rather than the alert itself), expiry, source, and
-    a couple of hashtags.
+    plain-English opener (WHAT + WHERE + WHEN folded together - see
+    build_plain_english_opener), the FULL safety instruction (kept intact
+    and prominent - this is the one part of the raw NWS text that should
+    never be trimmed), then only the SUPPLEMENTARY bullets (IMPACTS, and
+    any "Additional Details") - WHAT/WHERE/WHEN are deliberately excluded
+    here since the opener already covers them; repeating them as bullets
+    right below would just be the same sentence twice. Then expiry, source
+    (no outbound link - see note below), and a couple of hashtags.
+
+    Deliberately does NOT include a source URL: Facebook's algorithm
+    measurably suppresses reach on posts containing outbound links, and the
+    NWS `web` field is just the generic weather.gov homepage anyway (not a
+    link to this specific alert), so it costs reach for no real benefit.
 
     is_update=True adds a line making clear this is the SAME warning being
     re-posted because something about it genuinely changed (extended,
@@ -336,12 +347,17 @@ def build_facebook_caption(feature: dict, is_update: bool = False) -> str:
     expires = props.get("expires", "")
     instruction = props.get("instruction", "")
     sender = props.get("senderName", "")
-    web = props.get("web", "")
     description = props.get("description", "")
 
     bullets = [clean_bullet(b) for b in parse_description_bullets(description)]
-    main_bullets = [b for b in bullets if not b.lower().startswith("additional details")]
-    extra_bullets = [b for b in bullets if b.lower().startswith("additional details")]
+    # WHAT/WHERE/WHEN are already folded into the opener - showing them
+    # again here would just repeat the same sentence as separate bullets.
+    supplementary = [
+        b for b in bullets
+        if not (b.lower().startswith("what:") or b.lower().startswith("where:") or b.lower().startswith("when:"))
+    ]
+    main_bullets = [b for b in supplementary if not b.lower().startswith("additional details")]
+    extra_bullets = [b for b in supplementary if b.lower().startswith("additional details")]
 
     opener = build_plain_english_opener(feature, bullets)
     expires_str = format_alert_time_local(expires, get_alert_state(feature)) if expires else ""
@@ -368,7 +384,7 @@ def build_facebook_caption(feature: dict, is_update: bool = False) -> str:
     if expires_str:
         lines.append(f"⏰ In effect until {expires_str}.")
     if sender:
-        lines.append(f"Source: {sender}" + (f" | {web}" if web else ""))
+        lines.append(f"Source: {sender}")
 
     hashtags = build_hashtags(feature)
     if hashtags:
@@ -897,7 +913,7 @@ def build_html_template(
         <div class="area-text">{area_display}</div>
         {expires_html}
         <div class="source-text">Source: {sender}</div>
-        <div class="details-cue">👇 Full details below</div>
+        <div class="details-cue">See description for details</div>
     </div>
 </body>
 </html>"""
