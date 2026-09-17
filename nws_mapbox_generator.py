@@ -1079,6 +1079,13 @@ TARGET_STATES = ["TX", "OK", "KS", "NE", "FL", "LA", "MS", "AL", "MO", "NC"]
 
 DISCORD_CONTENT_LIMIT = 2000  # Discord's hard cap on a webhook message's `content` field
 
+# Testing aid: when enabled, every successful Discord post is followed by a
+# second message containing the alert's relevant JSON fields, so you can
+# verify what data actually drove a given image/caption. Set the env var to
+# "true" while testing; leave unset (defaults False) once you trust the
+# pipeline - this roughly doubles your Discord message volume otherwise.
+DEBUG_POST_RAW_JSON = os.environ.get("DEBUG_POST_RAW_JSON", "false").lower() == "true"
+
 
 def get_alert_id(feature: dict) -> str:
     """Pulls the stable unique id NWS assigns each alert (used as our dedup key)."""
@@ -1389,6 +1396,60 @@ def post_to_discord(webhook_url: str, image_path: str, caption: str) -> bool:
     return True
 
 
+def build_debug_json_payload(feature: dict) -> str:
+    """
+    Pulls just the fields the pipeline actually uses out of an alert -
+    skipping the full polygon geometry, which can run to thousands of
+    points and would blow past Discord's message limit for no debugging
+    value - and pretty-prints them. Lets you see exactly what data drove a
+    given post's image/caption without digging through Actions logs.
+    """
+    props = feature.get("properties", {})
+    debug_data = {
+        "id": get_alert_id(feature),
+        "vtec_key": extract_vtec_key(feature),
+        "event": props.get("event"),
+        "severity": props.get("severity"),
+        "urgency": props.get("urgency"),
+        "certainty": props.get("certainty"),
+        "areaDesc": props.get("areaDesc"),
+        "headline": props.get("headline"),
+        "description": props.get("description"),
+        "instruction": props.get("instruction"),
+        "expires": props.get("expires"),
+        "senderName": props.get("senderName"),
+        "geocode": props.get("geocode"),
+    }
+    return json.dumps(debug_data, indent=2, ensure_ascii=False)
+
+
+def post_debug_json_to_discord(webhook_url: str, feature: dict) -> bool:
+    """
+    Sends the alert's relevant JSON fields to Discord as a formatted code
+    block - a quick way to inspect the raw data behind a post during
+    testing. Truncates if it doesn't fit Discord's 2000-char message limit
+    (code fences included) rather than failing outright - a truncated debug
+    view is still useful, unlike a failed post.
+    """
+    debug_json = build_debug_json_payload(feature)
+    max_json_len = DISCORD_CONTENT_LIMIT - len("```json\n\n```") - 20  # fence + safety margin
+    if len(debug_json) > max_json_len:
+        debug_json = debug_json[:max_json_len] + "\n...(truncated)"
+
+    content = f"```json\n{debug_json}\n```"
+    try:
+        resp = requests.post(webhook_url, json={"content": content}, timeout=20)
+    except requests.RequestException as e:
+        print(f"❌ Debug JSON post failed (network error): {e}")
+        return False
+
+    if resp.status_code not in (200, 204):
+        print(f"❌ Debug JSON post failed ({resp.status_code}): {resp.text}")
+        return False
+    print("✅ Posted debug JSON to Discord")
+    return True
+
+
 def post_to_facebook(page_id: str, access_token: str, image_path: str, caption: str) -> bool:
     """
     Posts the composited image + caption to a Facebook Page via the Graph
@@ -1502,6 +1563,11 @@ def post_alert_to_platform(alert: dict, state: str, platform: str, config: dict,
 
         if platform == "discord":
             success = post_to_discord(config["discord_webhook_url"], out_path, caption)
+            if success and DEBUG_POST_RAW_JSON:
+                # Testing aid only - sends the alert's relevant JSON as a
+                # separate follow-up message, so you can eyeball exactly
+                # what data drove this post without checking Actions logs.
+                post_debug_json_to_discord(config["discord_webhook_url"], alert)
         elif platform == "facebook":
             success = post_to_facebook(config["fb_page_id"], config["fb_access_token"], out_path, caption)
         elif platform == "instagram":
