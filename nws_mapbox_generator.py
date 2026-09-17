@@ -272,6 +272,65 @@ def clean_bullet(bullet: str) -> str:
     return f"{label.strip().title()}: {rest.strip()}"
 
 
+def split_additional_details(raw_bullet: str) -> list:
+    """
+    Splits a raw 'ADDITIONAL DETAILS...' bullet into its '- ' prefixed
+    sub-items (radar notes, named locations, sometimes a stray safety-page
+    link) as a clean list, instead of parse_description_bullets' whitespace-
+    flattening gluing them into one run-on blob. After flattening, each
+    original '\\n- ' becomes ' - ' in the text, so splitting on that
+    recovers the original sub-items.
+
+    Also drops any sub-item that's purely a bare URL - a link buried in
+    body text costs Facebook reach the same way the `web` field did, and
+    this is where NWS sometimes embeds a safety-page link nobody asked for.
+    """
+    _, _, rest = raw_bullet.partition("...")
+    items = [s.strip() for s in rest.split(" - ") if s.strip()]
+    return [s for s in items if not re.match(r"^https?://\S+$", s, re.IGNORECASE)]
+
+
+def extract_named_locations(description: str) -> list:
+    """
+    Looks for NWS's own explicit list of affected towns/cities within the
+    description (commonly phrased "locations ... include... TownA, TownB
+    and TownC") and extracts them as a clean list. When present, this is
+    more accurate than a single reverse-geocoded guess of the polygon's
+    centroid - NWS is naming the actual places, not us estimating one.
+    Returns [] if no such list is found (heuristic regex - NWS phrasing
+    varies, this won't catch every product type).
+    """
+    # NWS wraps description text at a fixed width, so a town name can be
+    # split across a line break (e.g. "High\nValley") - normalize whitespace
+    # first so the character classes below don't break mid-name.
+    normalized = " ".join(description.split())
+
+    match = re.search(
+        r"locations?[^.]*?includ\w*\.{0,3}\s*"
+        r"([A-Z][A-Za-z .'-]+(?:,\s*[A-Z][A-Za-z .'-]+)*\s*(?:and|&)\s*[A-Z][A-Za-z .'-]+)\.",
+        normalized,
+        re.IGNORECASE,
+    )
+    if not match:
+        return []
+    raw_list = re.sub(r"\s+(and|&)\s+", ", ", match.group(1))
+    return [t.strip() for t in raw_list.split(",") if t.strip()]
+
+
+def extract_what_where_when(cleaned_bullets: list) -> tuple:
+    """Pulls (what_text, where_text, when_text) out of clean_bullet()-formatted bullets."""
+    what_text, where_text, when_text = "", "", ""
+    for b in cleaned_bullets:
+        lower = b.lower()
+        if lower.startswith("what:"):
+            what_text = b.split(":", 1)[1].strip().rstrip(".")
+        elif lower.startswith("where:"):
+            where_text = b.split(":", 1)[1].strip().rstrip(".")
+        elif lower.startswith("when:"):
+            when_text = b.split(":", 1)[1].strip().rstrip(".")
+    return what_text, where_text, when_text
+
+
 def build_plain_english_opener(feature: dict, bullets: list) -> str:
     """
     A synthesized, human-sounding opening line: WHAT + WHERE + WHEN folded
@@ -287,16 +346,7 @@ def build_plain_english_opener(feature: dict, bullets: list) -> str:
     area_desc = props.get("areaDesc", "")
     headline = props.get("headline", "")
 
-    what_text, where_text, when_text = "", "", ""
-    for b in bullets:
-        lower = b.lower()
-        if lower.startswith("what:"):
-            what_text = b.split(":", 1)[1].strip().rstrip(".")
-        elif lower.startswith("where:"):
-            where_text = b.split(":", 1)[1].strip().rstrip(".")
-        elif lower.startswith("when:"):
-            when_text = b.split(":", 1)[1].strip().rstrip(".")
-
+    what_text, where_text, when_text = extract_what_where_when(bullets)
     location = where_text or shorten_area_desc(area_desc)
 
     if what_text:
@@ -323,15 +373,22 @@ def build_hashtags(feature: dict) -> str:
 
 def build_facebook_caption(feature: dict, is_update: bool = False) -> str:
     """
-    Builds a ready-to-post caption: icon + event header, a synthesized
-    plain-English opener (WHAT + WHERE + WHEN folded together - see
-    build_plain_english_opener), the FULL safety instruction (kept intact
-    and prominent - this is the one part of the raw NWS text that should
-    never be trimmed), then only the SUPPLEMENTARY bullets (IMPACTS, and
-    any "Additional Details") - WHAT/WHERE/WHEN are deliberately excluded
-    here since the opener already covers them; repeating them as bullets
-    right below would just be the same sentence twice. Then expiry, source
-    (no outbound link - see note below), and a couple of hashtags.
+    Builds a ready-to-post caption in "Format B" - a sectioned layout with
+    clear headers for scannability:
+      icon + event header
+      plain-English opener (WHAT + WHERE + WHEN folded together)
+      ⚠️ SAFETY   - the FULL instruction text, never trimmed
+      📋 IMPACTS  - the Impacts bullet, if present
+      📍 AFFECTED AREAS - NWS's own named towns if it listed any (more
+                    accurate than a geocoding guess), else the WHERE text
+      ⏰ expiry | source combined into one compact footer line
+      hashtags
+
+    Deliberately drops the raw "Additional Details" meteorological minutiae
+    (radar timestamps, rainfall amounts) - it's real but non-actionable
+    detail that clutters a section layout meant to be scanned in seconds;
+    the genuinely useful part of Additional Details (named locations) is
+    pulled out into its own AFFECTED AREAS section instead.
 
     Deliberately does NOT include a source URL: Facebook's algorithm
     measurably suppresses reach on posts containing outbound links, and the
@@ -349,17 +406,22 @@ def build_facebook_caption(feature: dict, is_update: bool = False) -> str:
     sender = props.get("senderName", "")
     description = props.get("description", "")
 
-    bullets = [clean_bullet(b) for b in parse_description_bullets(description)]
-    # WHAT/WHERE/WHEN are already folded into the opener - showing them
-    # again here would just repeat the same sentence as separate bullets.
-    supplementary = [
-        b for b in bullets
-        if not (b.lower().startswith("what:") or b.lower().startswith("where:") or b.lower().startswith("when:"))
-    ]
-    main_bullets = [b for b in supplementary if not b.lower().startswith("additional details")]
-    extra_bullets = [b for b in supplementary if b.lower().startswith("additional details")]
+    raw_bullets = parse_description_bullets(description)
+    cleaned_bullets = [clean_bullet(b) for b in raw_bullets]
+    opener = build_plain_english_opener(feature, cleaned_bullets)
 
-    opener = build_plain_english_opener(feature, bullets)
+    impacts_text = ""
+    for raw in raw_bullets:
+        if raw.lower().startswith("impacts"):
+            impacts_text = clean_bullet(raw).split(":", 1)[1].strip()
+            break
+
+    named_locations = extract_named_locations(description) if description else []
+    # Only show a dedicated AFFECTED AREAS section when NWS named specific
+    # towns - that's new information. Without it, the fallback would just
+    # repeat the WHERE text already sitting in the opener, verbatim.
+    affected_areas = ", ".join(named_locations) if named_locations else ""
+
     expires_str = format_alert_time_local(expires, get_alert_state(feature)) if expires else ""
     instruction_clean = " ".join(instruction.split()) if instruction else ""
     icon = get_event_icon(event)
@@ -371,20 +433,21 @@ def build_facebook_caption(feature: dict, is_update: bool = False) -> str:
         lines += ["This warning has been updated (extended, expanded, or corrected).", ""]
 
     if instruction_clean:
-        lines += [f"🛟 {instruction_clean}", ""]
+        lines += ["⚠️ SAFETY", instruction_clean, ""]
 
-    if main_bullets:
-        lines += [f"• {b}" for b in main_bullets]
-        lines.append("")
+    if impacts_text:
+        lines += ["📋 IMPACTS", impacts_text, ""]
 
-    if extra_bullets:
-        lines += [f"• {b}" for b in extra_bullets]
-        lines.append("")
+    if affected_areas:
+        lines += ["📍 AFFECTED AREAS", affected_areas, ""]
 
+    footer_parts = []
     if expires_str:
-        lines.append(f"⏰ In effect until {expires_str}.")
+        footer_parts.append(f"⏰ Until {expires_str}")
     if sender:
-        lines.append(f"Source: {sender}")
+        footer_parts.append(sender)
+    if footer_parts:
+        lines.append(" | ".join(footer_parts))
 
     hashtags = build_hashtags(feature)
     if hashtags:
@@ -779,23 +842,34 @@ def build_html_template(
     area_desc = props.get("areaDesc", "")
     expires = props.get("expires", "")
     sender = props.get("senderName", "")
+    description = props.get("description", "")
     geometry = feature.get("geometry")
 
     icon = get_event_icon(event_raw)
     action_phrase = get_action_phrase(severity, urgency)
 
-    # "Near <city>" reads far better than a raw NWS zone name to someone
-    # scrolling fast - falls back to the zone text if reverse geocoding
-    # fails or the alert has no inline geometry to take a centroid from.
-    place_name = ""
-    if geometry:
-        try:
-            centroid = shape(geometry).centroid
-            place_name = get_nearby_place_name(centroid.x, centroid.y, MAPBOX_ACCESS_TOKEN)
-        except Exception:
-            place_name = ""
+    # Location text, in priority order:
+    #  1. NWS's own named towns from the description (most accurate - NWS
+    #     is naming the actual affected places, not us estimating one)
+    #  2. "Near <city>" via reverse-geocoding the polygon centroid
+    #  3. Plain zone/county text, if neither of the above is available
     zone_text = shorten_area_desc(area_desc)
-    area_display = f"Near {place_name} — {zone_text}" if place_name else zone_text
+    named_locations = extract_named_locations(description) if description else []
+
+    if named_locations:
+        shown = ", ".join(named_locations[:3])
+        if len(named_locations) > 3:
+            shown += f" & {len(named_locations) - 3} more"
+        area_display = shown
+    else:
+        place_name = ""
+        if geometry:
+            try:
+                centroid = shape(geometry).centroid
+                place_name = get_nearby_place_name(centroid.x, centroid.y, MAPBOX_ACCESS_TOKEN)
+            except Exception:
+                place_name = ""
+        area_display = f"Near {place_name} — {zone_text}" if place_name else zone_text
 
     expires_display = format_alert_time_local(expires, get_alert_state(feature)) if expires else ""
     badge_text_color = contrasting_halo(primary_color)
