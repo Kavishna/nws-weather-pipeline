@@ -307,7 +307,7 @@ def extract_named_locations(description: str) -> list:
 
     match = re.search(
         r"locations?[^.]*?includ\w*\.{0,3}\s*"
-        r"([A-Z][A-Za-z .'-]+(?:,\s*[A-Z][A-Za-z .'-]+)*\s*(?:and|&)\s*[A-Z][A-Za-z .'-]+)\.",
+        r"([A-Z][A-Za-z .'-]+(?:,\s*[A-Z][A-Za-z .'-]+)*(?:\s*(?:and|&)\s*[A-Z][A-Za-z .'-]+)?)\.",
         normalized,
         re.IGNORECASE,
     )
@@ -315,6 +315,66 @@ def extract_named_locations(description: str) -> list:
         return []
     raw_list = re.sub(r"\s+(and|&)\s+", ", ", match.group(1))
     return [t.strip() for t in raw_list.split(",") if t.strip()]
+
+
+def parse_alert_content(feature: dict) -> dict:
+    """
+    Unified content parser handling NWS's two distinct description
+    templates, returning the same {"opener", "impacts", "locations"}
+    structure regardless of which one an alert uses:
+
+    Format 1 (most warnings/watches/advisories): bulleted '* WHAT...',
+    '* WHERE...', '* WHEN...', '* IMPACTS...' sections.
+
+    Format 2 (Special Weather Statements - often radar-indicated severe
+    thunderstorm call-outs): a free-text lead sentence describing the
+    radar detection, followed by HAZARD.../SOURCE.../IMPACT... labels with
+    no bullet markers at all. This is a genuinely different NWS product
+    template, not a formatting variation of Format 1 - trying to parse it
+    with the '*'-splitting bullet parser silently finds nothing, which is
+    why these used to fall all the way back to just the bare headline.
+    """
+    props = feature.get("properties", {})
+    description = props.get("description", "") or ""
+    headline = props.get("headline", "")
+    event = props.get("event", "Weather Alert")
+
+    if "HAZARD..." in description and "* WHAT" not in description:
+        normalized = " ".join(description.split())
+        lead, _, rest = normalized.partition("HAZARD...")
+        hazard, _, rest = rest.partition("SOURCE...")
+        _source, _, impact = rest.partition("IMPACT...")
+
+        lead = lead.strip().rstrip(".")
+        hazard = hazard.strip().rstrip(".")
+        impact = impact.strip()
+
+        opener_parts = [p for p in (hazard, lead) if p]
+        opener = (". ".join(opener_parts) + ".") if opener_parts else (headline or event)
+
+        locations = extract_named_locations(impact) or extract_named_locations(description)
+        if locations:
+            # Now shown separately in AFFECTED AREAS - strip it out of the
+            # impact text so it isn't duplicated in both places.
+            impact = re.sub(
+                r"Locations?[^.]*?includ\w*\.{0,3}\s*[A-Z][A-Za-z .,'-]*\.",
+                "", impact, flags=re.IGNORECASE,
+            ).strip()
+        return {"opener": opener, "impacts": impact, "locations": locations}
+
+    # Format 1: standard bulleted WHAT/WHERE/WHEN/IMPACTS
+    raw_bullets = parse_description_bullets(description)
+    cleaned_bullets = [clean_bullet(b) for b in raw_bullets]
+    opener = build_plain_english_opener(feature, cleaned_bullets)
+
+    impacts_text = ""
+    for raw in raw_bullets:
+        if raw.lower().startswith("impacts"):
+            impacts_text = clean_bullet(raw).split(":", 1)[1].strip()
+            break
+
+    locations = extract_named_locations(description) if description else []
+    return {"opener": opener, "impacts": impacts_text, "locations": locations}
 
 
 def extract_what_where_when(cleaned_bullets: list) -> tuple:
@@ -401,26 +461,30 @@ def build_facebook_caption(feature: dict, is_update: bool = False) -> str:
     """
     props = feature.get("properties", {})
     event = props.get("event", "Weather Alert")
+    area_desc = props.get("areaDesc", "")
     expires = props.get("expires", "")
     instruction = props.get("instruction", "")
     sender = props.get("senderName", "")
-    description = props.get("description", "")
 
-    raw_bullets = parse_description_bullets(description)
-    cleaned_bullets = [clean_bullet(b) for b in raw_bullets]
-    opener = build_plain_english_opener(feature, cleaned_bullets)
+    parsed = parse_alert_content(feature)
+    opener = parsed["opener"]
+    impacts_text = parsed["impacts"]
+    named_locations = parsed["locations"]
 
-    impacts_text = ""
-    for raw in raw_bullets:
-        if raw.lower().startswith("impacts"):
-            impacts_text = clean_bullet(raw).split(":", 1)[1].strip()
-            break
-
-    named_locations = extract_named_locations(description) if description else []
-    # Only show a dedicated AFFECTED AREAS section when NWS named specific
-    # towns - that's new information. Without it, the fallback would just
-    # repeat the WHERE text already sitting in the opener, verbatim.
-    affected_areas = ", ".join(named_locations) if named_locations else ""
+    # AFFECTED AREAS shows the fullest location detail we have:
+    #  1. NWS's own named towns, when it lists any (most specific) -
+    #     handles both product formats via parse_alert_content
+    #  2. Otherwise, the COMPLETE areaDesc list of every affected county/
+    #     zone - NOT the shortened "X, Y & N more" version used on the
+    #     image, since a caption isn't space-constrained the way the image
+    #     is. This is genuinely different information from the opener's
+    #     WHERE text (a general prose description, not an enumerated list),
+    #     so showing both isn't redundant.
+    if named_locations:
+        affected_areas = ", ".join(named_locations)
+    else:
+        all_areas = [p.strip() for p in area_desc.split(";") if p.strip()]
+        affected_areas = ", ".join(all_areas)
 
     expires_str = format_alert_time_local(expires, get_alert_state(feature)) if expires else ""
     instruction_clean = " ".join(instruction.split()) if instruction else ""
@@ -854,7 +918,7 @@ def build_html_template(
     #  2. "Near <city>" via reverse-geocoding the polygon centroid
     #  3. Plain zone/county text, if neither of the above is available
     zone_text = shorten_area_desc(area_desc)
-    named_locations = extract_named_locations(description) if description else []
+    named_locations = parse_alert_content(feature)["locations"]
 
     if named_locations:
         shown = ", ".join(named_locations[:3])
