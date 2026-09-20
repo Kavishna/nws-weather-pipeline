@@ -307,7 +307,17 @@ def extract_named_locations(description: str) -> list:
 
     match = re.search(
         r"locations?[^.]*?includ\w*\.{0,3}\s*"
-        r"([A-Z][A-Za-z .'-]+(?:,\s*[A-Z][A-Za-z .'-]+)*(?:\s*(?:and|&)\s*[A-Z][A-Za-z .'-]+)?)\.",
+        # NOTE: no literal period inside the character class - periods used
+        # to be allowed (to support abbreviations like "St. Louis"), but
+        # that made the match greedy PAST the list's actual end: a period
+        # doesn't stop the match, it's just "another allowed character," so
+        # it kept consuming straight through into the next unrelated
+        # sentence ("...Jabara Airport. This includes the following
+        # highways.." all got captured as one blob). Trade-off: a town name
+        # containing a mid-word abbreviation period will now truncate at
+        # that period - rarer in practice than the sentence-bleed bug this
+        # fixes, so worth it.
+        r"([A-Z][A-Za-z '-]+(?:,\s*[A-Z][A-Za-z '-]+)*(?:\s*(?:and|&)\s*[A-Z][A-Za-z '-]+)?)\.",
         normalized,
         re.IGNORECASE,
     )
@@ -319,48 +329,39 @@ def extract_named_locations(description: str) -> list:
 
 def parse_alert_content(feature: dict) -> dict:
     """
-    Unified content parser handling NWS's two distinct description
+    Unified content parser handling NWS's THREE distinct description
     templates, returning the same {"opener", "impacts", "locations"}
     structure regardless of which one an alert uses:
 
     Format 1 (most warnings/watches/advisories): bulleted '* WHAT...',
     '* WHERE...', '* WHEN...', '* IMPACTS...' sections.
 
-    Format 2 (Special Weather Statements - often radar-indicated severe
-    thunderstorm call-outs): a free-text lead sentence describing the
-    radar detection, followed by HAZARD.../SOURCE.../IMPACT... labels with
-    no bullet markers at all. This is a genuinely different NWS product
-    template, not a formatting variation of Format 1 - trying to parse it
-    with the '*'-splitting bullet parser silently finds nothing, which is
-    why these used to fall all the way back to just the bare headline.
+    Format 2 (Special Weather Statements with no radar-warning bullets):
+    a free-text lead sentence, then HAZARD.../SOURCE.../IMPACT... labels
+    with NO bullet markers ('*') anywhere in the description.
+
+    Format 3 (the standard Severe Thunderstorm/Tornado Warning template):
+    '*'-bulleted sections for the warning type+area, expiry, and impacted
+    locations - but with the HAZARD.../SOURCE.../IMPACT... labels
+    unbulleted, sandwiched between the radar-detection bullet and the
+    locations bullet. This is genuinely different from Format 2: both
+    have HAZARD/SOURCE/IMPACT, but only Format 2 has zero '*' bullets.
+    Routing this through Format 2's parser (which ignores '*' boundaries
+    entirely) is what previously produced a garbled opener containing the
+    product code header and every bullet mashed into one blob.
     """
     props = feature.get("properties", {})
     description = props.get("description", "") or ""
     headline = props.get("headline", "")
     event = props.get("event", "Weather Alert")
 
-    if "HAZARD..." in description and "* WHAT" not in description:
-        normalized = " ".join(description.split())
-        lead, _, rest = normalized.partition("HAZARD...")
-        hazard, _, rest = rest.partition("SOURCE...")
-        _source, _, impact = rest.partition("IMPACT...")
+    has_hazard_label = "HAZARD..." in description
+    has_bullets = "*" in description
 
-        lead = lead.strip().rstrip(".")
-        hazard = hazard.strip().rstrip(".")
-        impact = impact.strip()
-
-        opener_parts = [p for p in (hazard, lead) if p]
-        opener = (". ".join(opener_parts) + ".") if opener_parts else (headline or event)
-
-        locations = extract_named_locations(impact) or extract_named_locations(description)
-        if locations:
-            # Now shown separately in AFFECTED AREAS - strip it out of the
-            # impact text so it isn't duplicated in both places.
-            impact = re.sub(
-                r"Locations?[^.]*?includ\w*\.{0,3}\s*[A-Z][A-Za-z .,'-]*\.",
-                "", impact, flags=re.IGNORECASE,
-            ).strip()
-        return {"opener": opener, "impacts": impact, "locations": locations}
+    if has_hazard_label and has_bullets:
+        return _parse_bulleted_hazard_format(description, headline, event)
+    elif has_hazard_label:
+        return _parse_freetext_hazard_format(description, headline, event)
 
     # Format 1: standard bulleted WHAT/WHERE/WHEN/IMPACTS
     raw_bullets = parse_description_bullets(description)
@@ -375,6 +376,68 @@ def parse_alert_content(feature: dict) -> dict:
 
     locations = extract_named_locations(description) if description else []
     return {"opener": opener, "impacts": impacts_text, "locations": locations}
+
+
+def _strip_locations_sentence(text: str) -> str:
+    """Removes a 'Locations ... include ... X.' sentence once its content has been extracted separately."""
+    return re.sub(
+        r"Locations?[^.]*?includ\w*\.{0,3}\s*[A-Z][A-Za-z .,'-]*\.",
+        "", text, flags=re.IGNORECASE,
+    ).strip()
+
+
+def _parse_freetext_hazard_format(description: str, headline: str, event: str) -> dict:
+    """Format 2: HAZARD/SOURCE/IMPACT with NO bullet markers anywhere - see parse_alert_content."""
+    normalized = " ".join(description.split())
+    lead, _, rest = normalized.partition("HAZARD...")
+    hazard, _, rest = rest.partition("SOURCE...")
+    _source, _, impact = rest.partition("IMPACT...")
+
+    lead = lead.strip().rstrip(".")
+    hazard = hazard.strip().rstrip(".")
+    impact = impact.strip()
+
+    opener_parts = [p for p in (hazard, lead) if p]
+    opener = (". ".join(opener_parts) + ".") if opener_parts else (headline or event)
+
+    locations = extract_named_locations(impact) or extract_named_locations(description)
+    if locations:
+        impact = _strip_locations_sentence(impact)
+    return {"opener": opener, "impacts": impact, "locations": locations}
+
+
+def _parse_bulleted_hazard_format(description: str, headline: str, event: str) -> dict:
+    """
+    Format 3: '*'-bulleted warning type/area, expiry, and locations
+    sections, with unbulleted HAZARD/SOURCE/IMPACT sandwiched between the
+    radar-detection bullet and the locations bullet - see
+    parse_alert_content. Splitting on '*' first (respecting the bullet
+    boundaries NWS actually put there) is what keeps this clean where
+    Format 2's parser got it wrong: the locations bullet is its own
+    isolated chunk, so it can't bleed into the impact text or vice versa.
+    """
+    raw_bullets = parse_description_bullets(description)
+
+    lead, hazard, impact, locations_bullet = "", "", "", ""
+    for b in raw_bullets:
+        if "HAZARD..." in b:
+            before_hazard, _, rest = b.partition("HAZARD...")
+            lead = before_hazard.strip().rstrip(".")
+            hazard_part, _, rest = rest.partition("SOURCE...")
+            hazard = hazard_part.strip().rstrip(".")
+            _source_part, _, impact_part = rest.partition("IMPACT...")
+            impact = impact_part.strip()
+        elif "impacted include" in b.lower() or b.lower().startswith("locations"):
+            locations_bullet = b
+
+    opener_parts = [p for p in (hazard, lead) if p]
+    opener = (". ".join(opener_parts) + ".") if opener_parts else (headline or event)
+
+    locations = extract_named_locations(locations_bullet) if locations_bullet else []
+    if not locations:
+        locations = extract_named_locations(description)
+
+    return {"opener": opener, "impacts": impact, "locations": locations}
 
 
 def extract_what_where_when(cleaned_bullets: list) -> tuple:
