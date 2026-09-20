@@ -1180,14 +1180,24 @@ def extract_vtec_key(feature: dict) -> str:
     return f"{office}-{phenomena}-{significance}-{etn}"
 
 
+EXPIRY_CHANGE_THRESHOLD_MINUTES = 15  # a shift smaller than this isn't worth a fresh post
+
+
 def build_content_fingerprint(feature: dict) -> str:
     """
     A hash of the fields that matter for 'did this warning meaningfully
-    change' - event, severity, area, expiry, headline. Used to tell a
-    genuine update (expanded area, extended time, corrected text) apart from
-    NWS simply re-serving the same still-active alert on the next poll.
-    Deliberately excludes bookkeeping fields like `sent` that can shift
-    without the actual warning content changing.
+    change' - event, severity, area. Deliberately excludes:
+      - headline: NWS regenerates its wording on nearly every re-issue
+        (timestamps, phrasing) even when nothing substantive changed, so
+        including it made almost every VTEC re-broadcast look like a
+        genuine update - a major source of Facebook flooding and wasted
+        Mapbox calls.
+      - expires: handled separately (see expiry_changed_meaningfully),
+        with an explicit minutes-threshold rather than exact-match
+        hashing, since a warning extended by 5 minutes isn't worth a
+        fresh post the way one extended by 3 hours is.
+    Also excludes bookkeeping fields like `sent`, which can shift without
+    the actual warning content changing.
     """
     props = feature.get("properties", {})
     fingerprint_source = json.dumps(
@@ -1195,12 +1205,31 @@ def build_content_fingerprint(feature: dict) -> str:
             "event": props.get("event", ""),
             "severity": props.get("severity", ""),
             "areaDesc": props.get("areaDesc", ""),
-            "expires": props.get("expires", ""),
-            "headline": props.get("headline", ""),
         },
         sort_keys=True,
     )
     return hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()
+
+
+def expiry_changed_meaningfully(
+    old_expires: str, new_expires: str, threshold_minutes: int = EXPIRY_CHANGE_THRESHOLD_MINUTES
+) -> bool:
+    """
+    True only if `new_expires` differs from `old_expires` by more than
+    `threshold_minutes`. Compares actual parsed timestamps (not a rounded
+    bucket), so there's no boundary artifact where a 2-minute shift near a
+    bucket edge gets misclassified as a big change.
+    """
+    if not old_expires or not new_expires:
+        return old_expires != new_expires  # can't compare -> any presence/absence change counts
+    try:
+        old_dt = datetime.fromisoformat(old_expires)
+        new_dt = datetime.fromisoformat(new_expires)
+    except ValueError:
+        return old_expires != new_expires  # unparseable -> fall back to exact string comparison
+
+    delta_minutes = abs((new_dt - old_dt).total_seconds()) / 60
+    return delta_minutes > threshold_minutes
 
 
 def safe_filename(alert_id: str) -> str:
@@ -1390,15 +1419,28 @@ def classify_alert_for_state(db, state: str, platform: str, feature: dict) -> st
     means a dead TikTok token doesn't block Discord/Facebook for the same
     state - each platform tracks its own independent posting history, so a
     platform-specific failure only ever gets retried on that one platform.
+
+    'update' fires on either: the core content hash changing (event,
+    severity, area), OR the expiry shifting by more than
+    EXPIRY_CHANGE_THRESHOLD_MINUTES - a 5-minute extension doesn't warrant
+    a fresh post, a 3-hour one does.
     """
     alert_id = get_alert_id(feature)
     vtec_key = extract_vtec_key(feature)
     content_hash = build_content_fingerprint(feature)
+    current_expires = feature.get("properties", {}).get("expires", "")
 
     record = get_posted_record(db, state, platform, vtec_key, alert_id)
     if record is None:
         return "new"
-    return "update" if record.get("content_hash") != content_hash else "unchanged"
+
+    if record.get("content_hash") != content_hash:
+        return "update"
+
+    if expiry_changed_meaningfully(record.get("expires", ""), current_expires):
+        return "update"
+
+    return "unchanged"
 
 
 def mark_posted_for_state(db, state: str, platform: str, feature: dict) -> None:
@@ -1406,6 +1448,7 @@ def mark_posted_for_state(db, state: str, platform: str, feature: dict) -> None:
     vtec_key = extract_vtec_key(feature)
     content_hash = build_content_fingerprint(feature)
     event = feature.get("properties", {}).get("event", "")
+    expires = feature.get("properties", {}).get("expires", "")
     key = vtec_key or alert_id
 
     db.collection("posted_alerts").document(posted_doc_id(state, platform, key)).set(
@@ -1415,6 +1458,7 @@ def mark_posted_for_state(db, state: str, platform: str, feature: dict) -> None:
             "alert_id": alert_id,
             "vtec_key": vtec_key,
             "content_hash": content_hash,
+            "expires": expires,
             "event": event,
             "posted_at": datetime.now(timezone.utc).isoformat(),
         }
