@@ -329,7 +329,7 @@ def extract_named_locations(description: str) -> list:
 
 def parse_alert_content(feature: dict) -> dict:
     """
-    Unified content parser handling NWS's THREE distinct description
+    Unified content parser handling NWS's FOUR distinct description
     templates, returning the same {"opener", "impacts", "locations"}
     structure regardless of which one an alert uses:
 
@@ -346,9 +346,14 @@ def parse_alert_content(feature: dict) -> dict:
     unbulleted, sandwiched between the radar-detection bullet and the
     locations bullet. This is genuinely different from Format 2: both
     have HAZARD/SOURCE/IMPACT, but only Format 2 has zero '*' bullets.
-    Routing this through Format 2's parser (which ignores '*' boundaries
-    entirely) is what previously produced a garbled opener containing the
-    product code header and every bullet mashed into one blob.
+
+    Format 4 (plain narrative statements - e.g. dense fog advisories):
+    NO bullets, NO HAZARD label, no structure at all - just flowing
+    prose paragraphs. Some of these alerts have `instruction: null`,
+    meaning the description text is the ONLY substantive content that
+    exists for the alert - falling back to the generic headline (as the
+    old code did whenever it didn't recognize the format) silently threw
+    that content away entirely.
     """
     props = feature.get("properties", {})
     description = props.get("description", "") or ""
@@ -362,6 +367,8 @@ def parse_alert_content(feature: dict) -> dict:
         return _parse_bulleted_hazard_format(description, headline, event)
     elif has_hazard_label:
         return _parse_freetext_hazard_format(description, headline, event)
+    elif not has_bullets:
+        return _parse_narrative_format(description, headline, event)
 
     # Format 1: standard bulleted WHAT/WHERE/WHEN/IMPACTS
     raw_bullets = parse_description_bullets(description)
@@ -376,6 +383,23 @@ def parse_alert_content(feature: dict) -> dict:
 
     locations = extract_named_locations(description) if description else []
     return {"opener": opener, "impacts": impacts_text, "locations": locations}
+
+
+def _parse_narrative_format(description: str, headline: str, event: str) -> dict:
+    """
+    Format 4: plain free-text narrative with no structural markers at all.
+    Since there's no structure to extract fields from, the description's
+    own text IS the content - using it directly (rather than discarding it
+    for the generic headline) is what actually preserves the alert's real
+    substance. Still attempts a locations extraction as a bonus, in case a
+    narrative statement happens to include an "affecting X, Y and Z"-style
+    phrase; falls back cleanly to [] (and areaDesc, at the caption layer)
+    if not.
+    """
+    normalized = " ".join(description.split())
+    opener = normalized if normalized else (headline or event)
+    locations = extract_named_locations(description) if description else []
+    return {"opener": opener, "impacts": "", "locations": locations}
 
 
 def _strip_locations_sentence(text: str) -> str:
