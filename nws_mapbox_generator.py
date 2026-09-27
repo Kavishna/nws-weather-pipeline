@@ -1,6 +1,5 @@
 import json
 import os
-import random
 import re
 import time
 import hashlib
@@ -290,6 +289,35 @@ def split_additional_details(raw_bullet: str) -> list:
     return [s for s in items if not re.match(r"^https?://\S+$", s, re.IGNORECASE)]
 
 
+def extract_additional_details(raw_bullets: list) -> list:
+    """
+    Finds this alert's 'ADDITIONAL DETAILS...' bullet, if it has one, and
+    returns whichever of its '-' prefixed sub-items are genuinely NEW
+    content for the caption. Two kinds of sub-item are deliberately
+    excluded because they're already surfaced elsewhere:
+      - the radar-detection/HAZARD/SOURCE/IMPACT sub-item (identified by
+        the embedded "HAZARD..." marker) - that's already parsed out into
+        the opener and `impacts` by _parse_bulleted_hazard_format, from
+        this SAME bullet
+      - a locations-list sub-item ("Locations impacted include...") -
+        that's already pulled into the AFFECTED AREAS section via
+        extract_named_locations
+    What's left (a storm's hail-size history, a follow-up radar note, an
+    extra safety remark) previously had nowhere to go and was silently
+    dropped - see build_facebook_caption's "ADDITIONAL DETAILS" section.
+    """
+    for b in raw_bullets:
+        if b.lower().startswith("additional details"):
+            items = split_additional_details(b)
+            return [
+                item for item in items
+                if "HAZARD..." not in item
+                and "impacted include" not in item.lower()
+                and not item.lower().startswith("locations")
+            ]
+    return []
+
+
 def extract_named_locations(description: str) -> list:
     """
     Looks for NWS's own explicit list of affected towns/cities within the
@@ -330,8 +358,12 @@ def extract_named_locations(description: str) -> list:
 def parse_alert_content(feature: dict) -> dict:
     """
     Unified content parser handling NWS's FOUR distinct description
-    templates, returning the same {"opener", "impacts", "locations"}
-    structure regardless of which one an alert uses:
+    templates, returning the same {"opener", "impacts", "locations",
+    "additional_details"} structure regardless of which one an alert uses.
+    "additional_details" is only ever non-empty for Format 1 and Format 3,
+    the two formats that carry a '*'-bulleted 'ADDITIONAL DETAILS...'
+    section - see extract_additional_details for what does and doesn't end
+    up in it:
 
     Format 1 (most warnings/watches/advisories): bulleted '* WHAT...',
     '* WHERE...', '* WHEN...', '* IMPACTS...' sections.
@@ -382,7 +414,13 @@ def parse_alert_content(feature: dict) -> dict:
             break
 
     locations = extract_named_locations(description) if description else []
-    return {"opener": opener, "impacts": impacts_text, "locations": locations}
+    additional_details = extract_additional_details(raw_bullets)
+    return {
+        "opener": opener,
+        "impacts": impacts_text,
+        "locations": locations,
+        "additional_details": additional_details,
+    }
 
 
 def _parse_narrative_format(description: str, headline: str, event: str) -> dict:
@@ -399,7 +437,7 @@ def _parse_narrative_format(description: str, headline: str, event: str) -> dict
     normalized = " ".join(description.split())
     opener = normalized if normalized else (headline or event)
     locations = extract_named_locations(description) if description else []
-    return {"opener": opener, "impacts": "", "locations": locations}
+    return {"opener": opener, "impacts": "", "locations": locations, "additional_details": []}
 
 
 def _strip_locations_sentence(text: str) -> str:
@@ -427,7 +465,7 @@ def _parse_freetext_hazard_format(description: str, headline: str, event: str) -
     locations = extract_named_locations(impact) or extract_named_locations(description)
     if locations:
         impact = _strip_locations_sentence(impact)
-    return {"opener": opener, "impacts": impact, "locations": locations}
+    return {"opener": opener, "impacts": impact, "locations": locations, "additional_details": []}
 
 
 def _parse_bulleted_hazard_format(description: str, headline: str, event: str) -> dict:
@@ -445,7 +483,35 @@ def _parse_bulleted_hazard_format(description: str, headline: str, event: str) -
     lead, hazard, impact, locations_bullet = "", "", "", ""
     for b in raw_bullets:
         if "HAZARD..." in b:
-            before_hazard, _, rest = b.partition("HAZARD...")
+            # This bullet sometimes carries its own "ADDITIONAL DETAILS..."
+            # label and one or more OTHER '-' prefixed sub-items besides
+            # the radar-detection/HAZARD/SOURCE/IMPACT one (a hail-size
+            # history note, a follow-up radar remark) - see
+            # extract_additional_details, which pulls those out separately
+            # from this same bullet. Isolate just the hazard sub-item here
+            # first, or the label leaks into `lead` and IMPACT... keeps
+            # consuming text straight through into the next sub-item.
+            # This bullet's own header label ("WHEN...", "ADDITIONAL
+            # DETAILS...", whatever NWS used) is boilerplate, not content -
+            # strip it whenever it precedes the "HAZARD..." marker, or it
+            # leaks straight into `lead` below. Guarded by position (not a
+            # specific label string) so it generalizes to every label NWS
+            # actually uses, without risk of eating "HAZARD..." itself in
+            # the rare case a bullet has no separate header at all.
+            hazard_idx = b.find("HAZARD...")
+            label_end = b.find("...")
+            if label_end != -1 and label_end < hazard_idx:
+                # Not stripped here - a "- " sub-item marker can immediately
+                # follow the label, and .split(" - ") below only recognizes
+                # it as a separator (dropping it cleanly via the empty-first-
+                # element case) if that leading space survives.
+                hazard_bullet = b[label_end + 3:]
+            else:
+                hazard_bullet = b
+            sub_items = [s.strip() for s in hazard_bullet.split(" - ") if s.strip()]
+            hazard_item = next((s for s in sub_items if "HAZARD..." in s), hazard_bullet)
+
+            before_hazard, _, rest = hazard_item.partition("HAZARD...")
             lead = before_hazard.strip().rstrip(".")
             hazard_part, _, rest = rest.partition("SOURCE...")
             hazard = hazard_part.strip().rstrip(".")
@@ -461,7 +527,13 @@ def _parse_bulleted_hazard_format(description: str, headline: str, event: str) -
     if not locations:
         locations = extract_named_locations(description)
 
-    return {"opener": opener, "impacts": impact, "locations": locations}
+    additional_details = extract_additional_details(raw_bullets)
+    return {
+        "opener": opener,
+        "impacts": impact,
+        "locations": locations,
+        "additional_details": additional_details,
+    }
 
 
 def extract_what_where_when(cleaned_bullets: list) -> tuple:
@@ -526,16 +598,19 @@ def build_facebook_caption(feature: dict, is_update: bool = False) -> str:
       plain-English opener (WHAT + WHERE + WHEN folded together)
       ⚠️ SAFETY   - the FULL instruction text, never trimmed
       📋 IMPACTS  - the Impacts bullet, if present
+      🔎 ADDITIONAL DETAILS - any extra bulleted facts NWS included beyond
+                    IMPACTS/locations (a storm's hail-size history, a
+                    follow-up radar note), if present
       📍 AFFECTED AREAS - NWS's own named towns if it listed any (more
                     accurate than a geocoding guess), else the WHERE text
       ⏰ expiry | source combined into one compact footer line
       hashtags
 
-    Deliberately drops the raw "Additional Details" meteorological minutiae
-    (radar timestamps, rainfall amounts) - it's real but non-actionable
-    detail that clutters a section layout meant to be scanned in seconds;
-    the genuinely useful part of Additional Details (named locations) is
-    pulled out into its own AFFECTED AREAS section instead.
+    ADDITIONAL DETAILS is deliberately narrower than the raw NWS bullet:
+    the radar-detection/HAZARD/SOURCE/IMPACT content is already folded into
+    the opener and IMPACTS above, and a locations sentence is already
+    pulled into AFFECTED AREAS below - see extract_additional_details. Only
+    genuinely new sub-items land here, so nothing gets said twice.
 
     Deliberately does NOT include a source URL: Facebook's algorithm
     measurably suppresses reach on posts containing outbound links, and the
@@ -557,6 +632,7 @@ def build_facebook_caption(feature: dict, is_update: bool = False) -> str:
     opener = parsed["opener"]
     impacts_text = parsed["impacts"]
     named_locations = parsed["locations"]
+    additional_details = parsed.get("additional_details", [])
 
     # AFFECTED AREAS shows the fullest location detail we have:
     #  1. NWS's own named towns, when it lists any (most specific) -
@@ -589,6 +665,9 @@ def build_facebook_caption(feature: dict, is_update: bool = False) -> str:
     if impacts_text:
         lines += ["📋 IMPACTS", impacts_text, ""]
 
+    if additional_details:
+        lines += ["🔎 ADDITIONAL DETAILS"] + [f"• {d}" for d in additional_details] + [""]
+
     if affected_areas:
         lines += ["📍 AFFECTED AREAS", affected_areas, ""]
 
@@ -605,36 +684,6 @@ def build_facebook_caption(feature: dict, is_update: bool = False) -> str:
         lines += ["", hashtags]
 
     return "\n".join(lines)
-
-
-def fetch_random_polygon_alert():
-    """
-    Fetch active alerts from NWS API and return a random one that's usable -
-    either it has an inline polygon, or it has UGC zone codes we can resolve
-    to a shape via the zones API (see geometry_from_zones).
-    """
-    url = "https://api.weather.gov/alerts/active"
-    print("Fetching active alerts from NWS API...")
-
-    response = requests.get(url, headers=HEADERS, timeout=15)
-    response.raise_for_status()
-    data = response.json()
-
-    features = data.get("features", [])
-    usable_alerts = [
-        f for f in features
-        if f.get("properties", {}).get("status") != "Test"
-        and (
-            f.get("geometry") is not None
-            or f.get("properties", {}).get("geocode", {}).get("UGC")
-        )
-    ]
-
-    if not usable_alerts:
-        print("No active alerts with usable geometry found right now.")
-        return None
-
-    return random.choice(usable_alerts)
 
 
 def get_nws_colors(event_name: str) -> dict:
@@ -1845,18 +1894,6 @@ if __name__ == "__main__":
     db = get_firestore_client()  # uses GOOGLE_APPLICATION_CREDENTIALS or gcloud auth application-default login
 
     POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "120"))
-
-    print(f"Starting continuous polling every {POLL_INTERVAL_SECONDS}s across {TARGET_STATES}...")
-    while True:
-        try:
-            run_alert_pipeline(db, states=TARGET_STATES)
-        except Exception as e:
-            # A bad cycle (network blip, NWS hiccup, Firestore hiccup) shouldn't
-            # kill the whole process - log it and try again next interval.
-            print(f"⚠️ Pipeline run failed: {e}")
-
-        print(f"Sleeping {POLL_INTERVAL_SECONDS}s until next check...\n")
-        time.sleep(POLL_INTERVAL_SECONDS)
 
     print(f"Starting continuous polling every {POLL_INTERVAL_SECONDS}s across {TARGET_STATES}...")
     while True:
