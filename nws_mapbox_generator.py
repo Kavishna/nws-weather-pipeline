@@ -1842,47 +1842,76 @@ def post_to_tiktok(access_token: str, image_path: str, caption: str) -> bool:
     )
 
 
-def post_alert_to_platform(alert: dict, state: str, platform: str, config: dict, is_update: bool) -> bool:
+def get_or_build_alert_image(alert: dict, is_update: bool, image_cache: dict) -> str:
     """
-    Generates the styled image + caption once, then dispatches to whichever
-    platform this call is for. Returns True only on CONFIRMED success - the
-    caller uses this to decide whether to mark the alert as posted (a failed
-    post must NOT be marked posted, so it gets retried next cycle instead of
-    silently vanishing).
+    Returns the path to this alert's styled image, generating it (via
+    Mapbox) only the first time it's needed and reusing the same file for
+    every other (state, platform) destination that posts this same alert
+    in this run.
+
+    Without this cache, a single real-world alert that touches 2 states
+    and posts to 2 platforms per state would regenerate 4 IDENTICAL images
+    - the image depends only on the alert's own content (geometry, event,
+    colors, is_update banner), never on which state/platform it's being
+    posted to - burning 4x the Mapbox Static Images + Geocoding calls for
+    one real event. Keying the cache on (alert_id, is_update) rather than
+    just alert_id matters because classification is tracked independently
+    per (state, platform): the SAME alert can legitimately be "new" for
+    one destination (just baseline-seeded) and "update" for another
+    (already posted earlier) in the same run, and those need visibly
+    different images (the UPDATE banner).
     """
     alert_id = get_alert_id(alert)
-    out_path = f"_pipeline_out_{safe_filename(state + '_' + platform + '_' + alert_id)}.png"
-    success = False
-    try:
-        generate_styled_facebook_image(
-            feature=alert,
-            token=MAPBOX_ACCESS_TOKEN,
-            output_filename=out_path,
-            map_style="streets-v12",
-            preset_ratio="portrait",
-            padding=140,
-            is_update=is_update,
-        )
-        caption = build_facebook_caption(alert, is_update=is_update)
+    cache_key = (alert_id, is_update)
+    if cache_key in image_cache:
+        return image_cache[cache_key]
 
-        if platform == "discord":
-            success = post_to_discord(config["discord_webhook_url"], out_path, caption)
-            if success and DEBUG_POST_RAW_JSON:
-                # Testing aid only - sends the alert's relevant JSON as a
-                # separate follow-up message, so you can eyeball exactly
-                # what data drove this post without checking Actions logs.
-                post_debug_json_to_discord(config["discord_webhook_url"], alert)
-        elif platform == "facebook":
-            success = post_to_facebook(config["fb_page_id"], config["fb_access_token"], out_path, caption)
-        elif platform == "instagram":
-            success = post_to_instagram(config["ig_user_id"], config["ig_access_token"], out_path, caption)
-        elif platform == "tiktok":
-            success = post_to_tiktok(config["tiktok_access_token"], out_path, caption)
-        else:
-            print(f"⚠️ Unknown platform '{platform}' for '{state}' - skipping.")
-    finally:
-        if os.path.exists(out_path):
-            os.remove(out_path)
+    suffix = "update" if is_update else "new"
+    out_path = f"_pipeline_cache_{safe_filename(alert_id)}_{suffix}.png"
+    generate_styled_facebook_image(
+        feature=alert,
+        token=MAPBOX_ACCESS_TOKEN,
+        output_filename=out_path,
+        map_style="streets-v12",
+        preset_ratio="portrait",
+        padding=140,
+        is_update=is_update,
+    )
+    image_cache[cache_key] = out_path
+    return out_path
+
+
+def post_alert_to_platform(alert: dict, state: str, platform: str, config: dict, image_path: str, is_update: bool) -> bool:
+    """
+    Builds the caption and dispatches the ALREADY-GENERATED image at
+    `image_path` to whichever platform this call is for. Returns True only
+    on CONFIRMED success - the caller uses this to decide whether to mark
+    the alert as posted (a failed post must NOT be marked posted, so it
+    gets retried next cycle instead of silently vanishing).
+
+    Does NOT generate or delete `image_path` - that image is shared across
+    every (state, platform) destination posting this same alert in this
+    run (see get_or_build_alert_image), so its lifecycle is owned by the
+    caller (run_alert_pipeline), not by any single platform post.
+    """
+    success = False
+    caption = build_facebook_caption(alert, is_update=is_update)
+
+    if platform == "discord":
+        success = post_to_discord(config["discord_webhook_url"], image_path, caption)
+        if success and DEBUG_POST_RAW_JSON:
+            # Testing aid only - sends the alert's relevant JSON as a
+            # separate follow-up message, so you can eyeball exactly
+            # what data drove this post without checking Actions logs.
+            post_debug_json_to_discord(config["discord_webhook_url"], alert)
+    elif platform == "facebook":
+        success = post_to_facebook(config["fb_page_id"], config["fb_access_token"], image_path, caption)
+    elif platform == "instagram":
+        success = post_to_instagram(config["ig_user_id"], config["ig_access_token"], image_path, caption)
+    elif platform == "tiktok":
+        success = post_to_tiktok(config["tiktok_access_token"], image_path, caption)
+    else:
+        print(f"⚠️ Unknown platform '{platform}' for '{state}' - skipping.")
     return success
 
 
@@ -1896,6 +1925,12 @@ def run_alert_pipeline(db, states: list) -> None:
     is NOT marked posted, so it's naturally retried on the next poll cycle
     instead of silently disappearing - and a failure on one platform never
     blocks the others for the same state.
+
+    Generates each alert's image AT MOST ONCE per run (per distinct
+    is_update value), no matter how many states or platforms it fans out
+    to - see get_or_build_alert_image. image_cache lives for the duration
+    of this one run and its files are cleaned up in the `finally` below,
+    after every state/platform has had a chance to use them.
     """
     destinations = get_enabled_destinations(db)
     target_states = [s for s in states if s in destinations]
@@ -1911,38 +1946,48 @@ def run_alert_pipeline(db, states: list) -> None:
         for state in get_alert_touched_states(alert) & set(target_states):
             alerts_by_state[state].append(alert)
 
-    for state, state_alerts in alerts_by_state.items():
-        platforms = destinations[state].get("platforms", {})
+    image_cache: dict = {}
+    try:
+        for state, state_alerts in alerts_by_state.items():
+            platforms = destinations[state].get("platforms", {})
 
-        for platform, config in platforms.items():
-            if not is_platform_configured(platform, config):
-                continue  # placeholder entry (empty values) - not active yet, skip entirely
+            for platform, config in platforms.items():
+                if not is_platform_configured(platform, config):
+                    continue  # placeholder entry (empty values) - not active yet, skip entirely
 
-            if seed_baseline_for_platform_if_needed(db, state, platform, state_alerts):
-                continue  # this (state, platform) was just baseline-seeded - post nothing this run
+                if seed_baseline_for_platform_if_needed(db, state, platform, state_alerts):
+                    continue  # this (state, platform) was just baseline-seeded - post nothing this run
 
-            for alert in state_alerts:
-                classification = classify_alert_for_state(db, state, platform, alert)
-                if classification == "unchanged":
-                    continue
+                for alert in state_alerts:
+                    classification = classify_alert_for_state(db, state, platform, alert)
+                    if classification == "unchanged":
+                        continue
 
-                is_update = classification == "update"
-                event = alert.get("properties", {}).get("event", "Weather Alert")
-                alert_id = get_alert_id(alert)
-                tag = "UPDATE" if is_update else "NEW"
+                    is_update = classification == "update"
+                    event = alert.get("properties", {}).get("event", "Weather Alert")
+                    alert_id = get_alert_id(alert)
+                    tag = "UPDATE" if is_update else "NEW"
 
-                try:
-                    success = post_alert_to_platform(alert, state, platform, config, is_update)
-                    if success:
-                        mark_posted_for_state(db, state, platform, alert)
-                        print(f"✅ [{tag}] {event} -> {state}/{platform}")
-                    else:
-                        print(f"⚠️ Post failed for '{event}' -> {state}/{platform} - will retry next cycle (not marked posted).")
-                except Exception as e:
-                    # One bad alert/platform (oversized geometry edge case, network hiccup,
-                    # dead token) shouldn't take down the whole run, or affect other platforms
-                    # for this same state - log and move on. Not marked posted, so it retries.
-                    print(f"⚠️ Failed to process alert '{event}' ({alert_id}) for {state}/{platform}: {e}")
+                    try:
+                        image_path = get_or_build_alert_image(alert, is_update, image_cache)
+                        success = post_alert_to_platform(alert, state, platform, config, image_path, is_update)
+                        if success:
+                            mark_posted_for_state(db, state, platform, alert)
+                            print(f"✅ [{tag}] {event} -> {state}/{platform}")
+                        else:
+                            print(f"⚠️ Post failed for '{event}' -> {state}/{platform} - will retry next cycle (not marked posted).")
+                    except Exception as e:
+                        # One bad alert/platform (oversized geometry edge case, network hiccup,
+                        # dead token) shouldn't take down the whole run, or affect other platforms
+                        # for this same state - log and move on. Not marked posted, so it retries.
+                        print(f"⚠️ Failed to process alert '{event}' ({alert_id}) for {state}/{platform}: {e}")
+    finally:
+        # Cached images are only ever needed within this one run - clean them
+        # all up now that every state/platform has had its chance to use them,
+        # regardless of whether the run above completed cleanly or raised.
+        for cached_path in image_cache.values():
+            if os.path.exists(cached_path):
+                os.remove(cached_path)
 
 
 if __name__ == "__main__":
