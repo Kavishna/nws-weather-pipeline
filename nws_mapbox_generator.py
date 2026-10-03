@@ -359,11 +359,15 @@ def parse_alert_content(feature: dict) -> dict:
     """
     Unified content parser handling NWS's FOUR distinct description
     templates, returning the same {"opener", "impacts", "locations",
-    "additional_details"} structure regardless of which one an alert uses.
-    "additional_details" is only ever non-empty for Format 1 and Format 3,
-    the two formats that carry a '*'-bulleted 'ADDITIONAL DETAILS...'
-    section - see extract_additional_details for what does and doesn't end
-    up in it:
+    "additional_details", "hazard_labels"} structure regardless of which
+    one an alert uses. "additional_details" is only ever non-empty for
+    Format 1 and Format 3, the two formats that carry a '*'-bulleted
+    'ADDITIONAL DETAILS...' section - see extract_additional_details for
+    what does and doesn't end up in it. "hazard_labels" is only ever
+    non-empty for Format 1, the only format seen so far to bundle multiple
+    hazards into one product via NWS's 'For the <Hazard>, ...' pattern
+    (e.g. a Coastal Flood Advisory issued alongside a High Rip Current
+    Risk) - see split_combined_hazards:
 
     Format 1 (most warnings/watches/advisories): bulleted '* WHAT...',
     '* WHERE...', '* WHEN...', '* IMPACTS...' sections.
@@ -405,7 +409,7 @@ def parse_alert_content(feature: dict) -> dict:
     # Format 1: standard bulleted WHAT/WHERE/WHEN/IMPACTS
     raw_bullets = parse_description_bullets(description)
     cleaned_bullets = [clean_bullet(b) for b in raw_bullets]
-    opener = build_plain_english_opener(feature, cleaned_bullets)
+    opener, hazard_labels = build_plain_english_opener(feature, cleaned_bullets)
 
     impacts_text = ""
     for raw in raw_bullets:
@@ -420,6 +424,7 @@ def parse_alert_content(feature: dict) -> dict:
         "impacts": impacts_text,
         "locations": locations,
         "additional_details": additional_details,
+        "hazard_labels": hazard_labels,
     }
 
 
@@ -437,7 +442,7 @@ def _parse_narrative_format(description: str, headline: str, event: str) -> dict
     normalized = " ".join(description.split())
     opener = normalized if normalized else (headline or event)
     locations = extract_named_locations(description) if description else []
-    return {"opener": opener, "impacts": "", "locations": locations, "additional_details": []}
+    return {"opener": opener, "impacts": "", "locations": locations, "additional_details": [], "hazard_labels": []}
 
 
 def _strip_locations_sentence(text: str) -> str:
@@ -465,7 +470,7 @@ def _parse_freetext_hazard_format(description: str, headline: str, event: str) -
     locations = extract_named_locations(impact) or extract_named_locations(description)
     if locations:
         impact = _strip_locations_sentence(impact)
-    return {"opener": opener, "impacts": impact, "locations": locations, "additional_details": []}
+    return {"opener": opener, "impacts": impact, "locations": locations, "additional_details": [], "hazard_labels": []}
 
 
 def _parse_bulleted_hazard_format(description: str, headline: str, event: str) -> dict:
@@ -483,28 +488,26 @@ def _parse_bulleted_hazard_format(description: str, headline: str, event: str) -
     lead, hazard, impact, locations_bullet = "", "", "", ""
     for b in raw_bullets:
         if "HAZARD..." in b:
-            # This bullet sometimes carries its own "ADDITIONAL DETAILS..."
-            # label and one or more OTHER '-' prefixed sub-items besides
-            # the radar-detection/HAZARD/SOURCE/IMPACT one (a hail-size
-            # history note, a follow-up radar remark) - see
-            # extract_additional_details, which pulls those out separately
-            # from this same bullet. Isolate just the hazard sub-item here
-            # first, or the label leaks into `lead` and IMPACT... keeps
-            # consuming text straight through into the next sub-item.
-            # This bullet's own header label ("WHEN...", "ADDITIONAL
-            # DETAILS...", whatever NWS used) is boilerplate, not content -
-            # strip it whenever it precedes the "HAZARD..." marker, or it
-            # leaks straight into `lead` below. Guarded by position (not a
-            # specific label string) so it generalizes to every label NWS
-            # actually uses, without risk of eating "HAZARD..." itself in
-            # the rare case a bullet has no separate header at all.
+            # This bullet sometimes carries its own header label ("WHEN...",
+            # "ADDITIONAL DETAILS...", whatever NWS used) and one or more
+            # OTHER '-' prefixed sub-items besides the radar-detection/
+            # HAZARD/SOURCE/IMPACT one (a hail-size history note, a
+            # follow-up radar remark) - see extract_additional_details,
+            # which pulls those out separately from this same bullet.
+            # Strip the header label (whenever it precedes "HAZARD...", by
+            # position rather than a specific label string, so it
+            # generalizes to every label NWS actually uses) and isolate
+            # just the hazard sub-item, or the label leaks into `lead` and
+            # IMPACT... keeps consuming text straight through into the
+            # next sub-item.
             hazard_idx = b.find("HAZARD...")
             label_end = b.find("...")
             if label_end != -1 and label_end < hazard_idx:
-                # Not stripped here - a "- " sub-item marker can immediately
-                # follow the label, and .split(" - ") below only recognizes
-                # it as a separator (dropping it cleanly via the empty-first-
-                # element case) if that leading space survives.
+                # Not .strip()'d here - a "- " sub-item marker can
+                # immediately follow the label, and .split(" - ") below
+                # only recognizes it as a separator (dropping it cleanly
+                # via the empty-first-element case) if that leading space
+                # survives.
                 hazard_bullet = b[label_end + 3:]
             else:
                 hazard_bullet = b
@@ -533,6 +536,7 @@ def _parse_bulleted_hazard_format(description: str, headline: str, event: str) -
         "impacts": impact,
         "locations": locations,
         "additional_details": additional_details,
+        "hazard_labels": [],
     }
 
 
@@ -550,7 +554,25 @@ def extract_what_where_when(cleaned_bullets: list) -> tuple:
     return what_text, where_text, when_text
 
 
-def build_plain_english_opener(feature: dict, bullets: list) -> str:
+def split_combined_hazards(text: str) -> list:
+    """
+    Splits a WHAT/WHEN bullet's text on NWS's 'For the <Hazard>, ...'
+    pattern - used whenever a single alert product bundles two or more
+    related hazards together under one shared WHERE/WHEN header (e.g. a
+    Coastal Flood Advisory issued alongside a High Rip Current Risk).
+    Returns [(hazard_label, hazard_text), ...] in the order NWS listed
+    them, or [] if the text doesn't use this pattern (the ordinary
+    single-hazard case, which is the vast majority of alerts).
+    """
+    matches = re.findall(
+        r"For the ([A-Za-z][A-Za-z ]*?),\s*(.*?)(?=\s*For the [A-Za-z][A-Za-z ]*?,|$)",
+        text,
+        re.DOTALL,
+    )
+    return [(label.strip(), cond.strip().rstrip(".")) for label, cond in matches if cond.strip()]
+
+
+def build_plain_english_opener(feature: dict, bullets: list) -> tuple:
     """
     A synthesized, human-sounding opening line: WHAT + WHERE + WHEN folded
     into one sentence. Uses NWS's own WHERE bullet for location - a
@@ -559,6 +581,15 @@ def build_plain_english_opener(feature: dict, bullets: list) -> str:
     ('Bourbon, Crawford & 27 more'), which reads terribly once an alert
     spans more than a couple counties. Falls back to the NWS headline (also
     human-written, just less tailored) if no usable WHAT bullet exists.
+
+    Returns (opener_sentence, hazard_labels). hazard_labels is only
+    non-empty when WHAT uses the combined-hazard 'For the <Hazard>, ...'
+    pattern (see split_combined_hazards): the ordinary single-hazard case
+    returns []. When it IS combined, gluing WHAT and WHEN into one run-on
+    sentence buries each hazard's own condition and timing (and injects
+    the shared location awkwardly mid-sentence) - one clear sentence per
+    hazard, location stated once at the end, reads far better and doesn't
+    silently drop the second hazard the way just showing `event` would.
     """
     props = feature.get("properties", {})
     event = props.get("event", "Weather Alert")
@@ -568,25 +599,45 @@ def build_plain_english_opener(feature: dict, bullets: list) -> str:
     what_text, where_text, when_text = extract_what_where_when(bullets)
     location = where_text or shorten_area_desc(area_desc)
 
+    what_hazards = split_combined_hazards(what_text) if what_text else []
+    if len(what_hazards) >= 2:
+        when_hazards = dict(split_combined_hazards(when_text)) if when_text else {}
+        sentences = []
+        for label, condition in what_hazards:
+            sentence = f"{label}: {condition}"
+            timing = when_hazards.get(label)
+            if timing:
+                sentence += f" ({timing})"
+            sentences.append(sentence + ".")
+        return " ".join(sentences) + f" For {location}.", [label for label, _ in what_hazards]
+
     if what_text:
         sentence = f"{what_text} for {location}"
         if when_text:
             sentence += f" — {when_text}"
-        return sentence + "."
-    return headline or f"{event} in effect for {location}."
+        return sentence + ".", []
+    return (headline or f"{event} in effect for {location}."), []
 
 
-def build_hashtags(feature: dict) -> str:
-    """A couple of lightweight hashtags (state + event) for discoverability."""
+def build_hashtags(feature: dict, hazard_labels: list = None) -> str:
+    """
+    A couple of lightweight hashtags (state + event) for discoverability.
+    When this is a combined-hazard product (see split_combined_hazards),
+    tags every bundled hazard rather than just the primary `event` - a
+    Coastal Flood Advisory + High Rip Current Risk post should be
+    discoverable under #HighRipCurrentRisk too, not just #CoastalFloodAdvisory.
+    """
     props = feature.get("properties", {})
     event = props.get("event", "")
     state = get_alert_state(feature)
-    event_tag = re.sub(r"[^A-Za-z]", "", event)
+    labels = hazard_labels if hazard_labels and len(hazard_labels) >= 2 else [event]
     tags = []
     if state:
         tags.append(f"#{state}Weather")
-    if event_tag:
-        tags.append(f"#{event_tag}")
+    for label in labels:
+        event_tag = re.sub(r"[^A-Za-z]", "", label)
+        if event_tag:
+            tags.append(f"#{event_tag}")
     return " ".join(tags)
 
 
@@ -594,8 +645,10 @@ def build_facebook_caption(feature: dict, is_update: bool = False) -> str:
     """
     Builds a ready-to-post caption in "Format B" - a sectioned layout with
     clear headers for scannability:
-      icon + event header
-      plain-English opener (WHAT + WHERE + WHEN folded together)
+      icon + event header (every bundled hazard, for a combined-hazard
+                    product - see split_combined_hazards)
+      plain-English opener (WHAT + WHERE + WHEN folded together; one
+                    sentence per hazard for a combined-hazard product)
       ⚠️ SAFETY   - the FULL instruction text, never trimmed
       📋 IMPACTS  - the Impacts bullet, if present
       🔎 ADDITIONAL DETAILS - any extra bulleted facts NWS included beyond
@@ -604,7 +657,7 @@ def build_facebook_caption(feature: dict, is_update: bool = False) -> str:
       📍 AFFECTED AREAS - NWS's own named towns if it listed any (more
                     accurate than a geocoding guess), else the WHERE text
       ⏰ expiry | source combined into one compact footer line
-      hashtags
+      hashtags (one per bundled hazard, for a combined-hazard product)
 
     ADDITIONAL DETAILS is deliberately narrower than the raw NWS bullet:
     the radar-detection/HAZARD/SOURCE/IMPACT content is already folded into
@@ -633,6 +686,7 @@ def build_facebook_caption(feature: dict, is_update: bool = False) -> str:
     impacts_text = parsed["impacts"]
     named_locations = parsed["locations"]
     additional_details = parsed.get("additional_details", [])
+    hazard_labels = parsed.get("hazard_labels", [])
 
     # AFFECTED AREAS shows the fullest location detail we have:
     #  1. NWS's own named towns, when it lists any (most specific) -
@@ -653,7 +707,13 @@ def build_facebook_caption(feature: dict, is_update: bool = False) -> str:
     instruction_clean = " ".join(instruction.split()) if instruction else ""
     icon = get_event_icon(event)
 
-    header = f"🔄 UPDATE: {icon} {event.upper()}" if is_update else f"{icon} {event.upper()}"
+    # A combined-hazard product's `event` field only names the PRIMARY
+    # hazard (e.g. just "Coastal Flood Advisory") - showing every bundled
+    # hazard in the header is what actually tells a scrolling reader that
+    # a High Rip Current Risk, say, is also in effect, not just the one
+    # named in the icon/event lookup above.
+    header_title = " + ".join(l.upper() for l in hazard_labels) if len(hazard_labels) >= 2 else event.upper()
+    header = f"🔄 UPDATE: {icon} {header_title}" if is_update else f"{icon} {header_title}"
     lines = [header, "", opener, ""]
 
     if is_update:
@@ -679,7 +739,7 @@ def build_facebook_caption(feature: dict, is_update: bool = False) -> str:
     if footer_parts:
         lines.append(" | ".join(footer_parts))
 
-    hashtags = build_hashtags(feature)
+    hashtags = build_hashtags(feature, hazard_labels)
     if hashtags:
         lines += ["", hashtags]
 
