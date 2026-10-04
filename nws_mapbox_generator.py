@@ -1346,6 +1346,16 @@ DISCORD_CONTENT_LIMIT = 2000  # Discord's hard cap on a webhook message's `conte
 # pipeline - this roughly doubles your Discord message volume otherwise.
 DEBUG_POST_RAW_JSON = os.environ.get("DEBUG_POST_RAW_JSON", "false").lower() == "true"
 
+# When False (the default), an alert classified as "update" - the SAME
+# warning being reissued with a meaningfully changed fingerprint or expiry
+# (see classify_alert_for_state) - is skipped instead of reposted: no
+# image regeneration, no platform post. Only a brand-new alert ("new")
+# still posts. This is the main lever for the repeat-post noise/Mapbox-
+# token cost from NWS's own frequent reissue cadence during active severe
+# weather - see run_alert_pipeline. Set the env var to "true" to restore
+# the old behavior of posting every update.
+POST_UPDATES_ENABLED = os.environ.get("POST_UPDATES_ENABLED", "false").lower() == "true"
+
 
 def get_alert_id(feature: dict) -> str:
     """Pulls the stable unique id NWS assigns each alert (used as our dedup key)."""
@@ -1915,22 +1925,54 @@ def post_alert_to_platform(alert: dict, state: str, platform: str, config: dict,
     return success
 
 
+# NWS's CAP `severity` field is one of: Extreme, Severe, Moderate, Minor,
+# Unknown. "Minor" covers the low-stakes advisories/statements (Frost
+# Advisory, Beach Hazards Statement, Air Quality Alert, etc.) that fire
+# constantly but rarely warrant a social post - excluding just this one
+# tier cuts a large share of the routine noise without touching anything
+# that's actually a Watch/Warning-level hazard. "Unknown" is left alone
+# (not treated as minor) since that's NWS omitting the field, not NWS
+# saying the hazard is low-stakes.
+IGNORED_SEVERITIES = {"Minor"}
+
+
+def is_ignored_severity(feature: dict) -> bool:
+    """True if this alert's severity tier should be skipped entirely - see IGNORED_SEVERITIES."""
+    return feature.get("properties", {}).get("severity", "") in IGNORED_SEVERITIES
+
+
 def run_alert_pipeline(db, states: list) -> None:
     """
     Full run: look up which of `states` have an enabled Firestore
-    destination, fetch active alerts across them, fan each alert out to
-    every state it touches (border-spanning alerts hit multiple states) AND
-    every platform configured for that state, classify per (state,
-    platform) as new/update/unchanged, and post accordingly. A failed post
-    is NOT marked posted, so it's naturally retried on the next poll cycle
+    destination, fetch active alerts across them, drop any whose severity
+    is in IGNORED_SEVERITIES, fan each surviving alert out to every state
+    it touches (border-spanning alerts hit multiple states) AND every
+    platform configured for that state, classify per (state, platform) as
+    new/update/unchanged, and post accordingly. A failed post is NOT
+    marked posted, so it's naturally retried on the next poll cycle
     instead of silently disappearing - and a failure on one platform never
     blocks the others for the same state.
+
+    A severity-ignored alert is dropped before any Firestore lookup,
+    baseline-seeding, or image generation happens for it - it's treated as
+    if it were never fetched, not merely skipped at posting time. This
+    means if a currently-Minor alert later gets reissued at a higher
+    severity (an upgrade), it will correctly be seen as "new" then, since
+    no posted-record was ever created for it while it was Minor.
 
     Generates each alert's image AT MOST ONCE per run (per distinct
     is_update value), no matter how many states or platforms it fans out
     to - see get_or_build_alert_image. image_cache lives for the duration
     of this one run and its files are cleaned up in the `finally` below,
     after every state/platform has had a chance to use them.
+
+    Unlike the severity filter above, an "update" classification can only
+    be known AFTER the Firestore lookup inside classify_alert_for_state
+    (it's relative to what's already stored for that specific (state,
+    platform) destination), so that lookup still happens either way. What
+    POST_UPDATES_ENABLED=False skips is everything downstream of it -
+    image generation and the actual post - for the common case of NWS
+    reissuing the same warning repeatedly during active severe weather.
     """
     destinations = get_enabled_destinations(db)
     target_states = [s for s in states if s in destinations]
@@ -1938,8 +1980,13 @@ def run_alert_pipeline(db, states: list) -> None:
         print("No enabled destinations configured for the requested states - nothing to do.")
         return
 
-    alerts = fetch_alerts_for_states(target_states)
-    print(f"Fetched {len(alerts)} unique active alert(s) across {len(target_states)} destination state(s).")
+    all_alerts = fetch_alerts_for_states(target_states)
+    alerts = [a for a in all_alerts if not is_ignored_severity(a)]
+    ignored_count = len(all_alerts) - len(alerts)
+    print(
+        f"Fetched {len(all_alerts)} unique active alert(s) across {len(target_states)} destination state(s)"
+        f" - {ignored_count} ignored (severity in {sorted(IGNORED_SEVERITIES)}), {len(alerts)} to process."
+    )
 
     alerts_by_state = {state: [] for state in target_states}
     for alert in alerts:
@@ -1961,6 +2008,19 @@ def run_alert_pipeline(db, states: list) -> None:
                 for alert in state_alerts:
                     classification = classify_alert_for_state(db, state, platform, alert)
                     if classification == "unchanged":
+                        continue
+
+                    if classification == "update" and not POST_UPDATES_ENABLED:
+                        # Deliberately NOT marked posted here (same as the
+                        # "unchanged" skip above) - leaving the stored
+                        # fingerprint/expiry untouched means it still
+                        # reflects the last alert state actually posted,
+                        # not this skipped one. That keeps future
+                        # comparisons correct: if POST_UPDATES_ENABLED is
+                        # turned back on later, or the warning eventually
+                        # escalates, classify_alert_for_state will still
+                        # correctly see everything that changed since the
+                        # last REAL post, not just since this skip.
                         continue
 
                     is_update = classification == "update"
