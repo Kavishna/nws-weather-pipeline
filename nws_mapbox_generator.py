@@ -1926,14 +1926,14 @@ def post_alert_to_platform(alert: dict, state: str, platform: str, config: dict,
 
 
 # NWS's CAP `severity` field is one of: Extreme, Severe, Moderate, Minor,
-# Unknown. "Minor" covers the low-stakes advisories/statements (Frost
-# Advisory, Beach Hazards Statement, Air Quality Alert, etc.) that fire
-# constantly but rarely warrant a social post - excluding just this one
-# tier cuts a large share of the routine noise without touching anything
-# that's actually a Watch/Warning-level hazard. "Unknown" is left alone
-# (not treated as minor) since that's NWS omitting the field, not NWS
-# saying the hazard is low-stakes.
-IGNORED_SEVERITIES = {"Minor"}
+# Unknown. Left empty for now - Minor was excluded for a while (it covers
+# low-stakes advisories/statements like Frost Advisory, Beach Hazards
+# Statement, Air Quality Alert) but that cut post volume more than wanted,
+# including genuinely useful Minor-tagged hazards (e.g. a High Rip Current
+# Risk bundled into a Coastal Flood Advisory - NWS's severity tiers are
+# fairly coarse for coastal/marine alerts). Add a severity string back
+# here (e.g. {"Minor"}) to resume filtering it out.
+IGNORED_SEVERITIES: set = set()
 
 
 def is_ignored_severity(feature: dict) -> bool:
@@ -1983,9 +1983,10 @@ def run_alert_pipeline(db, states: list) -> None:
     all_alerts = fetch_alerts_for_states(target_states)
     alerts = [a for a in all_alerts if not is_ignored_severity(a)]
     ignored_count = len(all_alerts) - len(alerts)
+    severity_note = f" - {ignored_count} ignored (severity in {sorted(IGNORED_SEVERITIES)})" if IGNORED_SEVERITIES else ""
     print(
         f"Fetched {len(all_alerts)} unique active alert(s) across {len(target_states)} destination state(s)"
-        f" - {ignored_count} ignored (severity in {sorted(IGNORED_SEVERITIES)}), {len(alerts)} to process."
+        f"{severity_note}, {len(alerts)} to process."
     )
 
     alerts_by_state = {state: [] for state in target_states}
