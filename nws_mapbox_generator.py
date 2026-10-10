@@ -1039,19 +1039,47 @@ def get_event_icon(event_name: str) -> str:
     return "⚠️"
 
 
-def get_action_phrase(severity: str, urgency: str) -> str:
+# Fixed red/orange/yellow urgency ramp for the severity badge + image
+# border. Deliberately independent of event type - get_nws_colors() (the
+# per-event NWS palette) still drives the map's own polygon/halo overlay
+# color untouched, but a lot of individually-serious event types (e.g.
+# Flood Warning) happen to have a calm-looking green or pastel as their
+# official NWS color, which read as "nothing urgent" when it was also
+# reused for the border and the "TAKE ACTION NOW" badge. These three
+# colors instead give an at-a-glance "how urgently should I react" signal
+# that's consistent no matter which of NWS's ~100 event types fired, and
+# they're keyed off the exact same tiers as the badge text so the two can
+# never show a mismatched color/phrase pair.
+SEVERITY_BADGE_LEVELS = {
+    "critical": {"phrase": "TAKE ACTION NOW", "color": "#E8192C"},  # red
+    "elevated": {"phrase": "STAY ALERT", "color": "#FF8C00"},       # orange
+    "informational": {"phrase": "BE AWARE", "color": "#FFD60A"},    # yellow
+}
+
+
+def get_severity_badge(severity: str, urgency: str) -> tuple:
     """
     Plain-language stand-in for raw NWS severity/urgency jargon. 'MODERATE'
     or 'EXPECTED' don't tell a non-meteorologist what to actually do -
     these three tiers map roughly to how urgently a reader should react.
+
+    Returns (phrase, color) together so the badge text and its background
+    (and the image border) always agree - see SEVERITY_BADGE_LEVELS above.
     """
     severity = (severity or "").lower()
     urgency = (urgency or "").lower()
     if severity in ("extreme", "severe") and urgency in ("immediate", "expected"):
-        return "TAKE ACTION NOW"
-    if severity == "moderate":
-        return "STAY ALERT"
-    return "BE AWARE"
+        level = SEVERITY_BADGE_LEVELS["critical"]
+    elif severity == "moderate":
+        level = SEVERITY_BADGE_LEVELS["elevated"]
+    else:
+        level = SEVERITY_BADGE_LEVELS["informational"]
+    return level["phrase"], level["color"]
+
+
+def get_action_phrase(severity: str, urgency: str) -> str:
+    """Back-compat wrapper - just the phrase half of get_severity_badge()."""
+    return get_severity_badge(severity, urgency)[0]
 
 
 def get_nearby_place_name(lon: float, lat: float, token: str) -> str:
@@ -1093,6 +1121,13 @@ def build_html_template(
     is_update=True adds an "UPDATED" tag next to the severity badge, so the
     same critical warning being re-posted (extended/expanded/corrected)
     reads clearly as an update rather than a brand-new alert.
+
+    primary_color is the NWS per-event-type color baked into map_image_path
+    (see get_nws_colors()/generate_mapbox_nws_image()) - it's accepted here
+    only so the map background stays whatever it already is; it no longer
+    drives the border or severity badge, which use the fixed red/orange/
+    yellow severity ramp from get_severity_badge() instead (see that
+    function's docstring for why).
     """
     props = feature.get("properties", {})
     event_raw = props.get("event", "Weather Alert")
@@ -1106,7 +1141,7 @@ def build_html_template(
     geometry = feature.get("geometry")
 
     icon = get_event_icon(event_raw)
-    action_phrase = get_action_phrase(severity, urgency)
+    action_phrase, severity_color = get_severity_badge(severity, urgency)
 
     # Location text, in priority order:
     #  1. NWS's own named towns from the description (most accurate - NWS
@@ -1132,7 +1167,7 @@ def build_html_template(
         area_display = f"Near {place_name} — {zone_text}" if place_name else zone_text
 
     expires_display = format_alert_time_local(expires, get_alert_state(feature)) if expires else ""
-    badge_text_color = contrasting_halo(primary_color)
+    badge_text_color = contrasting_halo(severity_color)
     map_data_uri = image_to_data_uri(map_image_path)
 
     expires_html = ""
@@ -1154,7 +1189,7 @@ def build_html_template(
         font-family: 'Helvetica Neue', Arial, sans-serif;
         position: relative;
         overflow: hidden;
-        border: 14px solid {primary_color};
+        border: 14px solid {severity_color};
     }}
     .map-bg {{
         position: absolute;
@@ -1170,7 +1205,7 @@ def build_html_template(
     }}
     .severity-badge {{
         display: inline-block;
-        background: {primary_color};
+        background: {severity_color};
         color: {badge_text_color};
         font-size: 22px;
         font-weight: 700;
