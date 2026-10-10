@@ -37,5 +37,4 @@ jobs:
           MAPBOX_ACCESS_TOKEN: ${{ secrets.MAPBOX_ACCESS_TOKEN }}
           GOOGLE_APPLICATION_CREDENTIALS: /tmp/firebase-key.json
           DEBUG_POST_RAW_JSON: "true"
-          POST_UPDATES_ENABLED: ${{ vars.POST_UPDATES_ENABLED }}
         run: python run_once.py
